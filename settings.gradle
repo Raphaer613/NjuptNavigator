@@ -8,6 +8,7 @@ pluginManagement {
         }
         maven {
             url = uri("https://maven.aliyun.com/repository/public")
+            mavenCentral()
         }
     }
 }
@@ -21,6 +22,7 @@ dependencyResolutionManagement {
         maven {
             url = uri("https://maven.aliyun.com/repository/public")
         }
+        mavenCentral()
     }
 }
 

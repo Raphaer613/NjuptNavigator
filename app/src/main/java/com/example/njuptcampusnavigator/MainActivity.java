@@ -3,6 +3,7 @@ package com.example.njuptcampusnavigator;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.speech.tts.TextToSpeech;
@@ -24,6 +25,11 @@ import com.baidu.location.LocationClient;
 import com.baidu.location.LocationClientOption;
 import com.baidu.mapapi.model.LatLng;
 import com.baidu.mapapi.search.core.SearchResult;
+import com.baidu.mapapi.search.geocode.GeoCodeOption;
+import com.baidu.mapapi.search.geocode.GeoCodeResult;
+import com.baidu.mapapi.search.geocode.GeoCoder;
+import com.baidu.mapapi.search.geocode.OnGetGeoCoderResultListener;
+import com.baidu.mapapi.search.geocode.ReverseGeoCodeResult;
 import com.baidu.mapapi.search.route.BikingRouteLine;
 import com.baidu.mapapi.search.route.BikingRoutePlanOption;
 import com.baidu.mapapi.search.route.BikingRouteResult;
@@ -51,6 +57,8 @@ public final class MainActivity extends Activity {
     private Place selectedPlace;
     private CampusMapView mapView;
     private EditText searchInput;
+    private EditText startInput;
+    private EditText endInput;
     private LinearLayout searchResults;
     private TextView locationStatus;
     private TextView detailText;
@@ -58,11 +66,49 @@ public final class MainActivity extends Activity {
     private RadioGroup routeMode;
     private LocationClient locationClient;
     private RoutePlanSearch routePlanSearch;
+    private GeoCoder geoCoder;
     private TextToSpeech textToSpeech;
     private boolean ttsReady;
     private boolean lastRouteCycling;
     private String lastRouteSummary = "尚未规划路线";
     private int temporaryPlaceIndex = 1;
+    private LatLng routeStartPoint;
+    private LatLng routeEndPoint;
+    private String routeEndName;
+
+    private interface CoordinateCallback {
+        void onResolved(LatLng point, String displayName);
+        void onFailure(String message);
+    }
+
+    private final OnGetGeoCoderResultListener geoCoderListener = new OnGetGeoCoderResultListener() {
+        @Override
+        public void onGetGeoCodeResult(GeoCodeResult result) {
+            if (result == null || result.error != SearchResult.ERRORNO.NO_ERROR
+                    || result.getLocation() == null) {
+                if (geocodeCallback != null) {
+                    CoordinateCallback callback = geocodeCallback;
+                    geocodeCallback = null;
+                    callback.onFailure("百度地图没有找到该地址");
+                }
+                return;
+            }
+            if (geocodeCallback != null) {
+                CoordinateCallback callback = geocodeCallback;
+                geocodeCallback = null;
+                String displayName = result.getAddress();
+                callback.onResolved(result.getLocation(),
+                        displayName == null || displayName.isEmpty() ? pendingGeocodeText : displayName);
+            }
+        }
+
+        @Override
+        public void onGetReverseGeoCodeResult(ReverseGeoCodeResult result) {
+        }
+    };
+
+    private CoordinateCallback geocodeCallback;
+    private String pendingGeocodeText;
 
     private final BDAbstractLocationListener locationListener = new BDAbstractLocationListener() {
         @Override
@@ -71,9 +117,16 @@ public final class MainActivity extends Activity {
                 locationStatus.setText("定位失败 · 使用校园中心点");
                 return;
             }
-            currentPoint = new LatLng(location.getLatitude(), location.getLongitude());
+
+            LatLng detectedPoint = new LatLng(location.getLatitude(), location.getLongitude());
+            if (CampusData.isInsideCampus(detectedPoint)) {
+                currentPoint = detectedPoint;
+                locationStatus.setText("百度定位已更新 · " + describeLocationType(location.getLocType()));
+            } else {
+                currentPoint = CampusData.SOUTH_GATE;
+                locationStatus.setText("检测到用户在校园外 · 已将当前位置设为南门");
+            }
             mapView.setCurrentPoint(currentPoint, location.getRadius(), location.getDirection());
-            locationStatus.setText("百度定位已更新 · " + describeLocationType(location.getLocType()));
         }
     };
 
@@ -139,6 +192,8 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(android.graphics.Color.rgb(23, 50, 77));
         routePlanSearch = RoutePlanSearch.newInstance();
         routePlanSearch.setOnGetRoutePlanResultListener(routeListener);
+        geoCoder = GeoCoder.newInstance();
+        geoCoder.setOnGetGeoCodeResultListener(geoCoderListener);
         buildScreen();
         setupTextToSpeech();
         setupLocation();
@@ -198,6 +253,24 @@ public final class MainActivity extends Activity {
         routeTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         routePanel.addView(routeTitle);
 
+        LinearLayout startRow = horizontal(0, 6, 0, 0);
+        startInput = routeInput("起点，例如：南校门；留空使用当前位置");
+        startRow.addView(startInput, new LinearLayout.LayoutParams(0, dp(46), 1));
+        Button currentButton = actionButton("当前位置", "#EAF2FF");
+        currentButton.setTextColor(color("#2D7FF9"));
+        currentButton.setOnClickListener(v -> {
+            startInput.setText("当前位置");
+            routeStartPoint = currentPoint;
+            routeSummary.setText("起点已设为当前位置（校外时自动使用南门）");
+        });
+        LinearLayout.LayoutParams currentButtonParams = new LinearLayout.LayoutParams(dp(92), dp(46));
+        currentButtonParams.setMargins(dp(8), 0, 0, 0);
+        startRow.addView(currentButton, currentButtonParams);
+        routePanel.addView(startRow);
+
+        endInput = routeInput("终点，例如：图书馆或南京邮电大学仙林校区");
+        routePanel.addView(endInput, new LinearLayout.LayoutParams(-1, dp(46)));
+
         LinearLayout routeLine = horizontal(0, 4, 0, 0);
         routeMode = new RadioGroup(this);
         routeMode.setOrientation(RadioGroup.HORIZONTAL);
@@ -218,7 +291,7 @@ public final class MainActivity extends Activity {
         routeLine.addView(planButton, wrap());
         routePanel.addView(routeLine);
 
-        routeSummary = text("请选择地图标记或热门地点作为目的地", 13, "#6E7C8F");
+        routeSummary = text("输入起点和终点后规划路线，也可以直接选择校园地点", 13, "#6E7C8F");
         routeSummary.setPadding(0, dp(4), 0, 0);
         routePanel.addView(routeSummary);
         Button navigationButton = actionButton("开始导航", "#17324D");
@@ -243,7 +316,7 @@ public final class MainActivity extends Activity {
         bottom.addView(hotTitle, hotTitleParams);
         for (Place place : places) {
             if (place.category.equals("教学楼") || place.name.equals("图书馆")
-                    || place.name.equals("第一食堂") || place.name.equals("操场")) {
+                    || place.name.equals("食堂") || place.name.equals("操场")) {
                 bottom.addView(placeButton(place));
             }
         }
@@ -292,6 +365,11 @@ public final class MainActivity extends Activity {
 
     private void selectPlace(Place place) {
         selectedPlace = place;
+        routeEndPoint = place.coordinate;
+        routeEndName = place.name;
+        if (endInput != null) {
+            endInput.setText(place.name);
+        }
         mapView.setSelectedPlace(place);
         detailText.setText(
                 place.name + "  ·  " + place.category
@@ -300,18 +378,85 @@ public final class MainActivity extends Activity {
                         + "\n主要功能  " + place.description
                         + "\n百度坐标  " + place.coordinate.latitude + ", " + place.coordinate.longitude
         );
-        routeSummary.setText("起点：当前位置    终点：" + place.name + "    请选择出行方式后规划");
+        routeSummary.setText("终点已设为：" + place.name + "    请选择出行方式后规划");
         searchResults.setVisibility(View.GONE);
     }
 
     private void planRoute() {
-        if (selectedPlace == null) {
-            Toast.makeText(this, "请先选择一个目的地", Toast.LENGTH_SHORT).show();
+        String startText = startInput == null ? "" : startInput.getText().toString().trim();
+        String endText = endInput == null ? "" : endInput.getText().toString().trim();
+        if (endText.isEmpty()) {
+            Toast.makeText(this, "请输入终点", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        routeSummary.setText("正在解析起点和终点...");
+        resolveAddress(startText, true, new CoordinateCallback() {
+            @Override
+            public void onResolved(LatLng point, String displayName) {
+                routeStartPoint = point;
+                resolveAddress(endText, false, new CoordinateCallback() {
+                    @Override
+                    public void onResolved(LatLng endPoint, String resolvedName) {
+                        routeEndPoint = endPoint;
+                        routeEndName = resolvedName;
+                        requestRoute(routeStartPoint, routeEndPoint);
+                    }
+
+                    @Override
+                    public void onFailure(String message) {
+                        showRouteFailure("终点解析失败：" + message);
+                    }
+                });
+            }
+
+            @Override
+            public void onFailure(String message) {
+                showRouteFailure("起点解析失败：" + message);
+            }
+        });
+    }
+
+    private void resolveAddress(String text, boolean start, CoordinateCallback callback) {
+        String value = text == null ? "" : text.trim();
+        if (start && (value.isEmpty() || value.equals("当前位置"))) {
+            callback.onResolved(currentPoint, "当前位置");
+            return;
+        }
+
+        for (Place place : places) {
+            if (place.name.equals(value) || place.name.contains(value) || value.contains(place.name)) {
+                callback.onResolved(place.coordinate, place.name);
+                return;
+            }
+        }
+
+        if (geoCoder == null) {
+            callback.onFailure("地理编码服务未初始化");
+            return;
+        }
+        pendingGeocodeText = value;
+        geocodeCallback = callback;
+        String address = value;
+        if (!value.contains("南京") && !value.contains("江苏")) {
+            address = "南京市栖霞区南京邮电大学仙林校区" + value;
+        }
+        boolean accepted = geoCoder.geocode(new GeoCodeOption()
+                .city("南京市")
+                .address(address));
+        if (!accepted) {
+            geocodeCallback = null;
+            callback.onFailure("地理编码请求未发出");
+        }
+    }
+
+    private void requestRoute(LatLng startPoint, LatLng endPoint) {
+        if (startPoint == null || endPoint == null) {
+            showRouteFailure("起点或终点坐标无效");
             return;
         }
         boolean cycling = isCyclingSelected();
-        PlanNode start = PlanNode.withLocation(currentPoint);
-        PlanNode end = PlanNode.withLocation(selectedPlace.coordinate);
+        PlanNode start = PlanNode.withLocation(startPoint);
+        PlanNode end = PlanNode.withLocation(endPoint);
         routeSummary.setText("正在调用百度地图规划" + (cycling ? "骑行" : "步行") + "路线...");
         if (cycling) {
             routePlanSearch.bikingSearch(new BikingRoutePlanOption()
@@ -341,17 +486,20 @@ public final class MainActivity extends Activity {
     }
 
     private void startNavigation() {
-        if (selectedPlace == null) {
-            Toast.makeText(this, "请先选择目的地并规划路线", Toast.LENGTH_SHORT).show();
+        if (routeEndPoint == null) {
+            Toast.makeText(this, "请先输入起点和终点并规划路线", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (textToSpeech != null && ttsReady) {
-            String mode = lastRouteCycling ? "骑行" : "步行";
-            String message = "正在前往" + selectedPlace.name + "，当前为" + mode
-                    + "路线。" + lastRouteSummary + "。请根据百度地图路线前进。";
-            textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, "campus-navigation");
-        }
-        Toast.makeText(this, "导航提示已开始", Toast.LENGTH_SHORT).show();
+        Intent intent = new Intent(this, NaviGuideActivity.class);
+        LatLng startPoint = routeStartPoint == null ? currentPoint : routeStartPoint;
+        intent.putExtra(NaviGuideActivity.EXTRA_START_LATITUDE, startPoint.latitude);
+        intent.putExtra(NaviGuideActivity.EXTRA_START_LONGITUDE, startPoint.longitude);
+        intent.putExtra(NaviGuideActivity.EXTRA_END_LATITUDE, routeEndPoint.latitude);
+        intent.putExtra(NaviGuideActivity.EXTRA_END_LONGITUDE, routeEndPoint.longitude);
+        intent.putExtra(NaviGuideActivity.EXTRA_CYCLING, isCyclingSelected());
+        intent.putExtra(NaviGuideActivity.EXTRA_PLACE_NAME,
+                routeEndName == null ? endInput.getText().toString().trim() : routeEndName);
+        startActivity(intent);
     }
 
     private void showAddActivityDialog() {
@@ -478,6 +626,9 @@ public final class MainActivity extends Activity {
         if (routePlanSearch != null) {
             routePlanSearch.destroy();
         }
+        if (geoCoder != null) {
+            geoCoder.destroy();
+        }
         if (mapView != null) {
             mapView.onDestroy();
         }
@@ -525,6 +676,16 @@ public final class MainActivity extends Activity {
         button.setPadding(dp(12), 0, dp(12), 0);
         button.setBackground(roundBackground(backgroundColor, 10));
         return button;
+    }
+
+    private EditText routeInput(String hint) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setHint(hint);
+        input.setTextSize(14);
+        input.setPadding(dp(12), 0, dp(12), 0);
+        input.setBackground(roundBackground("#FFFFFF", 10));
+        return input;
     }
 
     private LinearLayout horizontal(int left, int top, int right, int bottom) {
