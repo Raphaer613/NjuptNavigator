@@ -12,9 +12,13 @@ android {
         targetSdk 35
         versionCode 1
         versionName "1.0"
+        multiDexEnabled true
         manifestPlaceholders = [
                 baiduAk: project.findProperty("BAIDU_AK") ?: ""
         ]
+        javaCompileOptions {
+
+        }
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
         }
@@ -46,7 +50,9 @@ android {
 }
 
 dependencies {
-    implementation "com.baidu.lbsyun:BaiduMapSDK_Map:8.2.0"
+    implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+    implementation "com.baidu.lbsyun:BaiduMapSDK_Map-BWNavi:8.2.0"
     implementation "com.baidu.lbsyun:BaiduMapSDK_Search:8.2.0"
     implementation "com.baidu.lbsyun:BaiduMapSDK_Location:9.6.9"
+    implementation "com.airbnb.android:lottie:3.6.0"
 }

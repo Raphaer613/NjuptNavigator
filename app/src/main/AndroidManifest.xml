@@ -5,11 +5,18 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_LOCATION_EXTRA_COMMANDS" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
         android:name=".NjuptApplication"
         android:allowBackup="true"
+        android:icon="@drawable/navigator"
         android:label="@string/app_name"
+        android:roundIcon="@drawable/navigator"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <meta-data
@@ -24,6 +31,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".NaviGuideActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
     </application>
 
 </manifest>
