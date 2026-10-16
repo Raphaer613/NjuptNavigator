@@ -1,7 +1,9 @@
 package com.example.njuptcampusnavigator;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
+import android.os.Looper;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
 import android.view.Gravity;
@@ -22,6 +24,7 @@ import com.baidu.mapapi.walknavi.adapter.IWEngineInitListener;
 import com.baidu.mapapi.walknavi.adapter.IWRoutePlanListener;
 import com.baidu.mapapi.walknavi.adapter.IWTTSPlayer;
 import com.baidu.mapapi.walknavi.model.WalkRoutePlanError;
+import com.baidu.mapapi.walknavi.model.WalkNaviDisplayOption;
 import com.baidu.mapapi.walknavi.WalkNavigateHelper;
 import com.baidu.mapapi.walknavi.params.WalkRouteNodeInfo;
 import com.baidu.mapapi.walknavi.params.WalkNaviLaunchParam;
@@ -35,6 +38,7 @@ public final class NaviGuideActivity extends Activity {
     public static final String EXTRA_END_LONGITUDE = "end_longitude";
     public static final String EXTRA_CYCLING = "cycling";
     public static final String EXTRA_PLACE_NAME = "place_name";
+    private static final String EXTRA_GUIDE_READY = "guide_ready";
 
     private static final String TAG = "NjuptNavi";
 
@@ -46,6 +50,7 @@ public final class NaviGuideActivity extends Activity {
     private boolean ttsReady;
     private String pendingSpeech;
     private boolean pendingSpeechPreempt;
+    private boolean handOffToGuidePage;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -53,55 +58,73 @@ public final class NaviGuideActivity extends Activity {
         cycling = getIntent().getBooleanExtra(EXTRA_CYCLING, false);
         showLoading();
         setupTextToSpeech();
-        if (cycling) {
-            startBikeNavigation();
-        } else {
-            startWalkNavigation();
+        try {
+            if (getIntent().getBooleanExtra(EXTRA_GUIDE_READY, false)) {
+                startGuidePage();
+            } else if (cycling) {
+                startBikeNavigation();
+            } else {
+                startWalkNavigation();
+            }
+        } catch (RuntimeException error) {
+            Log.e(TAG, "导航启动异常", error);
+            showFailure("导航组件启动失败，请检查 BWNavi SDK、AK 权限和 assets 资源");
         }
     }
 
     private void startWalkNavigation() {
-        walkHelper = WalkNavigateHelper.getInstance();
-        walkHelper.initNaviEngine(this, new IWEngineInitListener() {
-            @Override
-            public void engineInitSuccess() {
-                walkHelper.setTTsPlayer(new IWTTSPlayer() {
-                    @Override
-                    public int playTTSText(String text, boolean preempt) {
-                        speakNavigationText(text, preempt);
-                        return 0;
-                    }
-                });
-                routeWalk();
-            }
+        try {
+            walkHelper = WalkNavigateHelper.getInstance();
+            applyWalkDisplayOption();
+            walkHelper.initNaviEngine(this, new IWEngineInitListener() {
+                @Override
+                public void engineInitSuccess() {
+                    walkHelper.setTTsPlayer(new IWTTSPlayer() {
+                        @Override
+                        public int playTTSText(String text, boolean preempt) {
+                            speakNavigationText(text, preempt);
+                            return 0;
+                        }
+                    });
+                    routeWalk();
+                }
 
-            @Override
-            public void engineInitFail() {
-                showFailure("步行导航引擎初始化失败");
-            }
-        });
+                @Override
+                public void engineInitFail() {
+                    showFailure("步行导航引擎初始化失败，请检查 AK 是否开通步行导航权限");
+                }
+            });
+        } catch (RuntimeException error) {
+            Log.e(TAG, "步行导航初始化异常", error);
+            showFailure("步行导航初始化异常");
+        }
     }
 
     private void startBikeNavigation() {
-        bikeHelper = BikeNavigateHelper.getInstance();
-        bikeHelper.initNaviEngine(this, new IBEngineInitListener() {
-            @Override
-            public void engineInitSuccess() {
-                bikeHelper.setTTsPlayer(new IBTTSPlayer() {
-                    @Override
-                    public int playTTSText(String text, boolean preempt) {
-                        speakNavigationText(text, preempt);
-                        return 0;
-                    }
-                });
-                routeBike();
-            }
+        try {
+            bikeHelper = BikeNavigateHelper.getInstance();
+            bikeHelper.initNaviEngine(this, new IBEngineInitListener() {
+                @Override
+                public void engineInitSuccess() {
+                    bikeHelper.setTTsPlayer(new IBTTSPlayer() {
+                        @Override
+                        public int playTTSText(String text, boolean preempt) {
+                            speakNavigationText(text, preempt);
+                            return 0;
+                        }
+                    });
+                    routeBike();
+                }
 
-            @Override
-            public void engineInitFail() {
-                showFailure("骑行导航引擎初始化失败");
-            }
-        });
+                @Override
+                public void engineInitFail() {
+                    showFailure("骑行导航引擎初始化失败，请检查 AK 是否开通骑行导航权限");
+                }
+            });
+        } catch (RuntimeException error) {
+            Log.e(TAG, "骑行导航初始化异常", error);
+            showFailure("骑行导航初始化异常");
+        }
     }
 
     private void routeWalk() {
@@ -114,27 +137,28 @@ public final class NaviGuideActivity extends Activity {
         WalkNaviLaunchParam params = new WalkNaviLaunchParam()
                 .startNodeInfo(startNode)
                 .endNodeInfo(endNode);
-        walkHelper.routePlanWithRouteNode(params, new IWRoutePlanListener() {
-            @Override
-            public void onRoutePlanStart() {
-                Log.i(TAG, "步行导航开始算路");
-            }
-
-            @Override
-            public void onRoutePlanSuccess() {
-                View navigationView = walkHelper.onCreate(NaviGuideActivity.this);
-                if (navigationView != null) {
-                    setContentView(navigationView);
+        try {
+            walkHelper.routePlanWithRouteNode(params, new IWRoutePlanListener() {
+                @Override
+                public void onRoutePlanStart() {
+                    Log.i(TAG, "步行导航开始算路");
                 }
-                navigationStarted = true;
-                walkHelper.startWalkNavi(NaviGuideActivity.this);
-            }
 
-            @Override
-            public void onRoutePlanFail(WalkRoutePlanError error) {
-                Log.e("WalkNavi", "算路失败，错误码："+error);
-            }
-        });
+                @Override
+                public void onRoutePlanSuccess() {
+                    runOnUiThread(() -> openGuidePage());
+                }
+
+                @Override
+                public void onRoutePlanFail(WalkRoutePlanError error) {
+                    Log.e(TAG, "步行导航算路失败，错误码：" + error);
+                    showFailure("百度地图未找到可用步行导航路线");
+                }
+            });
+        } catch (RuntimeException error) {
+            Log.e(TAG, "步行导航算路异常", error);
+            showFailure("步行导航算路异常");
+        }
     }
 
     private void routeBike() {
@@ -147,27 +171,28 @@ public final class NaviGuideActivity extends Activity {
         BikeNaviLaunchParam params = new BikeNaviLaunchParam()
                 .startNodeInfo(startNode)
                 .endNodeInfo(endNode);
-        bikeHelper.routePlanWithRouteNode(params, new IBRoutePlanListener() {
-            @Override
-            public void onRoutePlanStart() {
-                Log.i(TAG, "骑行导航开始算路");
-            }
-
-            @Override
-            public void onRoutePlanSuccess() {
-                View navigationView = bikeHelper.onCreate(NaviGuideActivity.this);
-                if (navigationView != null) {
-                    setContentView(navigationView);
+        try {
+            bikeHelper.routePlanWithRouteNode(params, new IBRoutePlanListener() {
+                @Override
+                public void onRoutePlanStart() {
+                    Log.i(TAG, "骑行导航开始算路");
                 }
-                navigationStarted = true;
-                bikeHelper.startBikeNavi(NaviGuideActivity.this);
-            }
 
-            @Override
-            public void onRoutePlanFail(BikeRoutePlanError error) {
-                showFailure("百度地图未找到可用骑行导航路线");
-            }
-        });
+                @Override
+                public void onRoutePlanSuccess() {
+                    runOnUiThread(() -> openGuidePage());
+                }
+
+                @Override
+                public void onRoutePlanFail(BikeRoutePlanError error) {
+                    Log.e(TAG, "骑行导航算路失败，错误码：" + error);
+                    showFailure("百度地图未找到可用骑行导航路线");
+                }
+            });
+        } catch (RuntimeException error) {
+            Log.e(TAG, "骑行导航算路异常", error);
+            showFailure("骑行导航算路异常");
+        }
     }
 
     private LatLng startPoint() {
@@ -182,6 +207,76 @@ public final class NaviGuideActivity extends Activity {
                 getIntent().getDoubleExtra(EXTRA_END_LATITUDE, CampusData.CAMPUS_CENTER.latitude),
                 getIntent().getDoubleExtra(EXTRA_END_LONGITUDE, CampusData.CAMPUS_CENTER.longitude)
         );
+    }
+
+    private void openGuidePage() {
+        handOffToGuidePage = true;
+        Intent intent = new Intent(this, NaviGuideActivity.class);
+        intent.putExtras(getIntent());
+        intent.putExtra(EXTRA_GUIDE_READY, true);
+        startActivity(intent);
+        finish();
+    }
+
+    private void startGuidePage() {
+        if (cycling) {
+            startBikeGuidePage();
+        } else {
+            startWalkGuidePage();
+        }
+    }
+
+    private void startWalkGuidePage() {
+        try {
+            walkHelper = WalkNavigateHelper.getInstance();
+            applyWalkDisplayOption();
+            walkHelper.setTTsPlayer(new IWTTSPlayer() {
+                @Override
+                public int playTTSText(String text, boolean preempt) {
+                    speakNavigationText(text, preempt);
+                    return 0;
+                }
+            });
+            View navigationView = walkHelper.onCreate(this);
+            if (navigationView == null) {
+                throw new IllegalStateException("WalkNavigateHelper.onCreate 返回空 View");
+            }
+            setContentView(navigationView);
+            navigationStarted = true;
+            walkHelper.startWalkNavi(this);
+        } catch (RuntimeException error) {
+            Log.e(TAG, "步行导航页面启动异常", error);
+            showFailure("步行导航页面启动失败：" + shortError(error));
+        }
+    }
+
+    private void applyWalkDisplayOption() {
+        if (walkHelper != null) {
+            walkHelper.setWalkNaviDisplayOption(new WalkNaviDisplayOption());
+        }
+    }
+
+    private void startBikeGuidePage() {
+        try {
+            bikeHelper = BikeNavigateHelper.getInstance();
+            bikeHelper.setTTsPlayer(new IBTTSPlayer() {
+                @Override
+                public int playTTSText(String text, boolean preempt) {
+                    speakNavigationText(text, preempt);
+                    return 0;
+                }
+            });
+            View navigationView = bikeHelper.onCreate(this);
+            if (navigationView == null) {
+                throw new IllegalStateException("BikeNavigateHelper.onCreate 返回空 View");
+            }
+            setContentView(navigationView);
+            navigationStarted = true;
+            bikeHelper.startBikeNavi(this);
+        } catch (RuntimeException error) {
+            Log.e(TAG, "骑行导航页面启动异常", error);
+            showFailure("骑行导航页面启动失败：" + shortError(error));
+        }
     }
 
     private void setupTextToSpeech() {
@@ -229,8 +324,20 @@ public final class NaviGuideActivity extends Activity {
     }
 
     private void showFailure(String message) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> showFailure(message));
+            return;
+        }
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
         finish();
+    }
+
+    private String shortError(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.trim().isEmpty()) {
+            return error.getClass().getSimpleName();
+        }
+        return error.getClass().getSimpleName() + "，" + message;
     }
 
     @Override
@@ -259,10 +366,12 @@ public final class NaviGuideActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (cycling && bikeHelper != null) {
-            bikeHelper.quit();
-        } else if (walkHelper != null) {
-            walkHelper.quit();
+        if (!handOffToGuidePage) {
+            if (cycling && bikeHelper != null) {
+                bikeHelper.quit();
+            } else if (walkHelper != null) {
+                walkHelper.quit();
+            }
         }
         if (textToSpeech != null) {
             textToSpeech.stop();

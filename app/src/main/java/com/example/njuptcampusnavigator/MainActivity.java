@@ -75,6 +75,9 @@ public final class MainActivity extends Activity {
     private LatLng routeStartPoint;
     private LatLng routeEndPoint;
     private String routeEndName;
+    private LatLng pendingRouteStartPoint;
+    private LatLng pendingRouteEndPoint;
+    private boolean routeReadyForNavigation;
 
     private interface CoordinateCallback {
         void onResolved(LatLng point, String displayName);
@@ -135,7 +138,8 @@ public final class MainActivity extends Activity {
         public void onGetWalkingRouteResult(WalkingRouteResult result) {
             if (result == null || result.error != SearchResult.ERRORNO.NO_ERROR
                     || result.getRouteLines() == null || result.getRouteLines().isEmpty()) {
-                showRouteFailure("百度地图未找到可用步行路线");
+                showRouteFailure("百度地图未找到可用步行路线，错误码："
+                        + routeError(result) + "，可能是校内道路未被百度步行路网覆盖");
                 return;
             }
             WalkingRouteLine line = result.getRouteLines().get(0);
@@ -152,7 +156,8 @@ public final class MainActivity extends Activity {
         public void onGetBikingRouteResult(BikingRouteResult result) {
             if (result == null || result.error != SearchResult.ERRORNO.NO_ERROR
                     || result.getRouteLines() == null || result.getRouteLines().isEmpty()) {
-                showRouteFailure("百度地图未找到可用骑行路线");
+                showRouteFailure("百度地图未找到可用骑行路线，错误码："
+                        + routeError(result) + "，可能是校内道路未被百度骑行路网覆盖");
                 return;
             }
             BikingRouteLine line = result.getRouteLines().get(0);
@@ -367,6 +372,7 @@ public final class MainActivity extends Activity {
         selectedPlace = place;
         routeEndPoint = place.coordinate;
         routeEndName = place.name;
+        routeReadyForNavigation = false;
         if (endInput != null) {
             endInput.setText(place.name);
         }
@@ -455,6 +461,9 @@ public final class MainActivity extends Activity {
             return;
         }
         boolean cycling = isCyclingSelected();
+        pendingRouteStartPoint = startPoint;
+        pendingRouteEndPoint = endPoint;
+        routeReadyForNavigation = false;
         PlanNode start = PlanNode.withLocation(startPoint);
         PlanNode end = PlanNode.withLocation(endPoint);
         routeSummary.setText("正在调用百度地图规划" + (cycling ? "骑行" : "步行") + "路线...");
@@ -472,6 +481,7 @@ public final class MainActivity extends Activity {
 
     private void showRoute(List<LatLng> points, boolean cycling, int distanceMeters, int durationSeconds) {
         lastRouteCycling = cycling;
+        routeReadyForNavigation = true;
         mapView.setRoute(points, cycling);
         int minutes = Math.max(1, Math.round(durationSeconds / 60f));
         lastRouteSummary = (cycling ? "骑行" : "步行")
@@ -481,13 +491,36 @@ public final class MainActivity extends Activity {
 
     private void showRouteFailure(String message) {
         lastRouteSummary = message;
-        routeSummary.setText(message + "。请确认 AK、网络和地点坐标是否可用。");
+        routeReadyForNavigation = false;
+        if (pendingRouteStartPoint != null && pendingRouteEndPoint != null) {
+            List<LatLng> guidePoints = new ArrayList<>();
+            guidePoints.add(pendingRouteStartPoint);
+            guidePoints.add(pendingRouteEndPoint);
+            mapView.setRoute(guidePoints, isCyclingSelected());
+            int directDistance = Math.round(distanceMeters(pendingRouteStartPoint, pendingRouteEndPoint));
+            routeSummary.setText(message + "。已显示起终点参考线，直线距离约 "
+                    + directDistance + " 米；这不是百度可导航路线。");
+        } else {
+            routeSummary.setText(message + "。请确认 AK、网络和地点坐标是否可用。");
+        }
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+    }
+
+    private String routeError(SearchResult result) {
+        if (result == null) {
+            return "result_null";
+        }
+        return result.error == null ? "error_null" : result.error.name();
     }
 
     private void startNavigation() {
         if (routeEndPoint == null) {
             Toast.makeText(this, "请先输入起点和终点并规划路线", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!routeReadyForNavigation) {
+            Toast.makeText(this, "百度路线规划成功后才能开始实时导航", Toast.LENGTH_LONG).show();
+            routeSummary.setText("请先点击“规划路线”，并等待百度返回可用步行/骑行路线后再开始导航。");
             return;
         }
         Intent intent = new Intent(this, NaviGuideActivity.class);
@@ -500,6 +533,19 @@ public final class MainActivity extends Activity {
         intent.putExtra(NaviGuideActivity.EXTRA_PLACE_NAME,
                 routeEndName == null ? endInput.getText().toString().trim() : routeEndName);
         startActivity(intent);
+    }
+
+    private float distanceMeters(LatLng start, LatLng end) {
+        double earthRadius = 6371000d;
+        double startLat = Math.toRadians(start.latitude);
+        double endLat = Math.toRadians(end.latitude);
+        double deltaLat = Math.toRadians(end.latitude - start.latitude);
+        double deltaLng = Math.toRadians(end.longitude - start.longitude);
+        double a = Math.sin(deltaLat / 2d) * Math.sin(deltaLat / 2d)
+                + Math.cos(startLat) * Math.cos(endLat)
+                * Math.sin(deltaLng / 2d) * Math.sin(deltaLng / 2d);
+        double c = 2d * Math.atan2(Math.sqrt(a), Math.sqrt(1d - a));
+        return (float) (earthRadius * c);
     }
 
     private void showAddActivityDialog() {
