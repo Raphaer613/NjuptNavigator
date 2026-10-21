@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.speech.tts.TextToSpeech;
 import android.view.Gravity;
@@ -51,6 +52,9 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final int LOCATION_REQUEST = 1001;
+    private static final String DEEP_LINK_SCHEME = "njuptnav";
+    private static final String DEEP_LINK_PLACE_HOST = "place";
+    private static final String BAIDU_URI_SOURCE = "andr.com.example.njuptcampusnavigator";
 
     private final List<Place> places = CampusData.defaultPlaces();
     private LatLng currentPoint = CampusData.CAMPUS_CENTER;
@@ -202,6 +206,14 @@ public final class MainActivity extends Activity {
         buildScreen();
         setupTextToSpeech();
         setupLocation();
+        handleDeepLink(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleDeepLink(intent);
     }
 
     private void buildScreen() {
@@ -313,6 +325,11 @@ public final class MainActivity extends Activity {
         detailText.setPadding(dp(14), dp(12), dp(14), dp(12));
         detailText.setBackground(roundBackground("#FFFFFF", 12));
         bottom.addView(detailText);
+        Button sharePlaceButton = actionButton("分享百度地图链接", "#2D7FF9");
+        sharePlaceButton.setOnClickListener(v -> shareSelectedPlace());
+        LinearLayout.LayoutParams shareParams = new LinearLayout.LayoutParams(-1, dp(42));
+        shareParams.setMargins(0, dp(8), 0, 0);
+        bottom.addView(sharePlaceButton, shareParams);
 
         TextView hotTitle = text("热门地点", 16, "#17324D");
         hotTitle.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -386,6 +403,140 @@ public final class MainActivity extends Activity {
         );
         routeSummary.setText("终点已设为：" + place.name + "    请选择出行方式后规划");
         searchResults.setVisibility(View.GONE);
+    }
+
+    private void shareSelectedPlace() {
+        if (selectedPlace == null) {
+            Toast.makeText(this, "请先选择一个地点", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String appLink = buildBaiduAppMarkerLink(selectedPlace).toString();
+        String webLink = buildBaiduWebMarkerLink(selectedPlace).toString();
+        String message = "我在南邮校园导航中分享了「" + selectedPlace.name + "」：\n"
+
+                + "用网页查看：\n" + webLink;
+        Intent shareIntent = new Intent(Intent.ACTION_SEND);
+        shareIntent.setType("text/plain");
+        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "南邮校园地点百度地图链接");
+        shareIntent.putExtra(Intent.EXTRA_TEXT, message);
+        startActivity(Intent.createChooser(shareIntent, "分享地点"));
+    }
+
+    private Uri buildBaiduAppMarkerLink(Place place) {
+        return new Uri.Builder()
+                .scheme("baidumap")
+                .authority("map")
+                .appendPath("marker")
+                .appendQueryParameter("location", place.coordinate.latitude + "," + place.coordinate.longitude)
+                .appendQueryParameter("title", place.name)
+                .appendQueryParameter("content", place.description)
+                .appendQueryParameter("coord_type", "bd09ll")
+                .appendQueryParameter("src", BAIDU_URI_SOURCE)
+                .build();
+    }
+
+    private Uri buildBaiduWebMarkerLink(Place place) {
+        return new Uri.Builder()
+                .scheme("https")
+                .authority("api.map.baidu.com")
+                .appendPath("marker")
+                .appendQueryParameter("location", place.coordinate.latitude + "," + place.coordinate.longitude)
+                .appendQueryParameter("title", place.name)
+                .appendQueryParameter("content", place.description)
+                .appendQueryParameter("coord_type", "bd09ll")
+                .appendQueryParameter("output", "html")
+                .appendQueryParameter("src", BAIDU_URI_SOURCE)
+                .build();
+    }
+
+    private Uri buildPlaceDeepLink(Place place) {
+        return new Uri.Builder()
+                .scheme(DEEP_LINK_SCHEME)
+                .authority(DEEP_LINK_PLACE_HOST)
+                .appendQueryParameter("name", place.name)
+                .appendQueryParameter("category", place.category)
+                .appendQueryParameter("lat", String.valueOf(place.coordinate.latitude))
+                .appendQueryParameter("lng", String.valueOf(place.coordinate.longitude))
+                .build();
+    }
+
+    private void handleDeepLink(Intent intent) {
+        if (intent == null || intent.getData() == null) {
+            return;
+        }
+        Uri data = intent.getData();
+        if (!DEEP_LINK_SCHEME.equals(data.getScheme())
+                || !DEEP_LINK_PLACE_HOST.equals(data.getHost())) {
+            return;
+        }
+
+        String name = data.getQueryParameter("name");
+        Place place = findPlaceByName(name);
+        if (place == null) {
+            place = createSharedPlace(data);
+        }
+        if (place == null) {
+            Toast.makeText(this, "分享链接中的地点信息不完整", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        selectPlace(place);
+        routeSummary.setText("已打开分享地点：" + place.name + "    可直接规划路线");
+    }
+
+    private Place findPlaceByName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return null;
+        }
+        String value = name.trim();
+        for (Place place : places) {
+            if (place.name.equals(value)) {
+                return place;
+            }
+        }
+        for (Place place : places) {
+            if (place.name.contains(value) || value.contains(place.name)) {
+                return place;
+            }
+        }
+        return null;
+    }
+
+    private Place createSharedPlace(Uri data) {
+        try {
+            String latText = data.getQueryParameter("lat");
+            String lngText = data.getQueryParameter("lng");
+            if (latText == null || lngText == null) {
+                return null;
+            }
+            double latitude = Double.parseDouble(latText);
+            double longitude = Double.parseDouble(lngText);
+            String name = data.getQueryParameter("name");
+            if (name == null || name.trim().isEmpty()) {
+                name = "分享地点";
+            }
+            String category = data.getQueryParameter("category");
+            if (category == null || category.trim().isEmpty()) {
+                category = "分享地点";
+            }
+            Place sharedPlace = new Place(
+                    name,
+                    category,
+                    "以分享链接为准",
+                    "未知",
+                    "来自好友分享的校内地点，可作为路线终点使用。",
+                    latitude,
+                    longitude,
+                    true
+            );
+            places.add(sharedPlace);
+            if (mapView != null) {
+                mapView.setPlaces(places);
+            }
+            return sharedPlace;
+        } catch (NumberFormatException error) {
+            return null;
+        }
     }
 
     private void planRoute() {
