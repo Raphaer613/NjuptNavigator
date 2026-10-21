@@ -54,6 +54,7 @@ public final class MainActivity extends Activity {
     private static final int LOCATION_REQUEST = 1001;
     private static final String DEEP_LINK_SCHEME = "njuptnav";
     private static final String DEEP_LINK_PLACE_HOST = "place";
+    private static final String BAIDU_URI_SOURCE = "andr.com.example.njuptcampusnavigator";
 
     private final List<Place> places = CampusData.defaultPlaces();
     private LatLng currentPoint = CampusData.CAMPUS_CENTER;
@@ -324,7 +325,7 @@ public final class MainActivity extends Activity {
         detailText.setPadding(dp(14), dp(12), dp(14), dp(12));
         detailText.setBackground(roundBackground("#FFFFFF", 12));
         bottom.addView(detailText);
-        Button sharePlaceButton = actionButton("分享地点", "#2D7FF9");
+        Button sharePlaceButton = actionButton("分享百度地图链接", "#2D7FF9");
         sharePlaceButton.setOnClickListener(v -> shareSelectedPlace());
         LinearLayout.LayoutParams shareParams = new LinearLayout.LayoutParams(-1, dp(42));
         shareParams.setMargins(0, dp(8), 0, 0);
@@ -409,13 +410,43 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "请先选择一个地点", Toast.LENGTH_SHORT).show();
             return;
         }
-        String link = buildPlaceDeepLink(selectedPlace).toString();
-        String message = "我在南邮校园导航中分享了「" + selectedPlace.name + "」：\n" + link;
+        String appLink = buildBaiduAppMarkerLink(selectedPlace).toString();
+        String webLink = buildBaiduWebMarkerLink(selectedPlace).toString();
+        String message = "我在南邮校园导航中分享了「" + selectedPlace.name + "」：\n"
+
+                + "用网页查看：\n" + webLink;
         Intent shareIntent = new Intent(Intent.ACTION_SEND);
         shareIntent.setType("text/plain");
-        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "南邮校园地点分享");
+        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "南邮校园地点百度地图链接");
         shareIntent.putExtra(Intent.EXTRA_TEXT, message);
         startActivity(Intent.createChooser(shareIntent, "分享地点"));
+    }
+
+    private Uri buildBaiduAppMarkerLink(Place place) {
+        return new Uri.Builder()
+                .scheme("baidumap")
+                .authority("map")
+                .appendPath("marker")
+                .appendQueryParameter("location", place.coordinate.latitude + "," + place.coordinate.longitude)
+                .appendQueryParameter("title", place.name)
+                .appendQueryParameter("content", place.description)
+                .appendQueryParameter("coord_type", "bd09ll")
+                .appendQueryParameter("src", BAIDU_URI_SOURCE)
+                .build();
+    }
+
+    private Uri buildBaiduWebMarkerLink(Place place) {
+        return new Uri.Builder()
+                .scheme("https")
+                .authority("api.map.baidu.com")
+                .appendPath("marker")
+                .appendQueryParameter("location", place.coordinate.latitude + "," + place.coordinate.longitude)
+                .appendQueryParameter("title", place.name)
+                .appendQueryParameter("content", place.description)
+                .appendQueryParameter("coord_type", "bd09ll")
+                .appendQueryParameter("output", "html")
+                .appendQueryParameter("src", BAIDU_URI_SOURCE)
+                .build();
     }
 
     private Uri buildPlaceDeepLink(Place place) {
