@@ -12,6 +12,7 @@ import com.baidu.mapapi.map.MapStatusUpdateFactory;
 import com.baidu.mapapi.map.MapView;
 import com.baidu.mapapi.map.Marker;
 import com.baidu.mapapi.map.MarkerOptions;
+import com.baidu.mapapi.map.MyLocationConfiguration;
 import com.baidu.mapapi.map.MyLocationData;
 import com.baidu.mapapi.map.Overlay;
 import com.baidu.mapapi.map.PolylineOptions;
@@ -44,6 +45,11 @@ public final class CampusMapView extends FrameLayout {
         baiduMap.setMapType(BaiduMap.MAP_TYPE_NORMAL);
         baiduMap.setMapStatus(MapStatusUpdateFactory.newLatLngZoom(CampusData.CAMPUS_CENTER, 16.5f));
         baiduMap.setMyLocationEnabled(true);
+        baiduMap.setMyLocationConfiguration(new MyLocationConfiguration(
+                MyLocationConfiguration.LocationMode.NORMAL,
+                true,
+                null
+        ));
         baiduMap.setOnMarkerClickListener(marker -> {
             Place place = markerPlaces.get(marker);
             if (place != null && listener != null) {

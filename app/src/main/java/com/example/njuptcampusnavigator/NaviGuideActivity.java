@@ -2,6 +2,7 @@ package com.example.njuptcampusnavigator;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.media.AudioAttributes;
 import android.os.Bundle;
 import android.os.Looper;
 import android.speech.tts.TextToSpeech;
@@ -39,6 +40,7 @@ public final class NaviGuideActivity extends Activity {
     public static final String EXTRA_CYCLING = "cycling";
     public static final String EXTRA_PLACE_NAME = "place_name";
     private static final String EXTRA_GUIDE_READY = "guide_ready";
+    private static final String TEST_SPEECH = "导航语音已启动";
 
     private static final String TAG = "NjuptNavi";
 
@@ -82,6 +84,7 @@ public final class NaviGuideActivity extends Activity {
                     walkHelper.setTTsPlayer(new IWTTSPlayer() {
                         @Override
                         public int playTTSText(String text, boolean preempt) {
+                            Log.i(TAG, "收到步行导航播报：" + text);
                             speakNavigationText(text, preempt);
                             return 0;
                         }
@@ -109,6 +112,7 @@ public final class NaviGuideActivity extends Activity {
                     bikeHelper.setTTsPlayer(new IBTTSPlayer() {
                         @Override
                         public int playTTSText(String text, boolean preempt) {
+                            Log.i(TAG, "收到骑行导航播报：" + text);
                             speakNavigationText(text, preempt);
                             return 0;
                         }
@@ -233,6 +237,7 @@ public final class NaviGuideActivity extends Activity {
             walkHelper.setTTsPlayer(new IWTTSPlayer() {
                 @Override
                 public int playTTSText(String text, boolean preempt) {
+                    Log.i(TAG, "收到步行导航播报：" + text);
                     speakNavigationText(text, preempt);
                     return 0;
                 }
@@ -244,6 +249,7 @@ public final class NaviGuideActivity extends Activity {
             setContentView(navigationView);
             navigationStarted = true;
             walkHelper.startWalkNavi(this);
+            speakNavigationText(TEST_SPEECH, false);
         } catch (RuntimeException error) {
             Log.e(TAG, "步行导航页面启动异常", error);
             showFailure("步行导航页面启动失败：" + shortError(error));
@@ -262,6 +268,7 @@ public final class NaviGuideActivity extends Activity {
             bikeHelper.setTTsPlayer(new IBTTSPlayer() {
                 @Override
                 public int playTTSText(String text, boolean preempt) {
+                    Log.i(TAG, "收到骑行导航播报：" + text);
                     speakNavigationText(text, preempt);
                     return 0;
                 }
@@ -273,6 +280,7 @@ public final class NaviGuideActivity extends Activity {
             setContentView(navigationView);
             navigationStarted = true;
             bikeHelper.startBikeNavi(this);
+            speakNavigationText(TEST_SPEECH, false);
         } catch (RuntimeException error) {
             Log.e(TAG, "骑行导航页面启动异常", error);
             showFailure("骑行导航页面启动失败：" + shortError(error));
@@ -282,15 +290,50 @@ public final class NaviGuideActivity extends Activity {
     private void setupTextToSpeech() {
         textToSpeech = new TextToSpeech(this, status -> {
             if (status == TextToSpeech.SUCCESS) {
-                int result = textToSpeech.setLanguage(Locale.CHINA);
-                ttsReady = result != TextToSpeech.LANG_MISSING_DATA
-                        && result != TextToSpeech.LANG_NOT_SUPPORTED;
+                textToSpeech.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build());
+                textToSpeech.setSpeechRate(1.0f);
+                textToSpeech.setPitch(1.0f);
+                int result = chooseTtsLanguage();
+                ttsReady = isTtsLanguageReady(result);
+                Log.i(TAG, "系统TTS初始化完成，engine=" + textToSpeech.getDefaultEngine()
+                        + ", languageResult=" + result + ", ready=" + ttsReady);
+                if (!ttsReady) {
+                    showToast("系统TTS不支持中文播报，请在手机设置中安装或切换语音引擎");
+                    return;
+                }
                 if (ttsReady && pendingSpeech != null) {
                     speakNavigationText(pendingSpeech, pendingSpeechPreempt);
                     pendingSpeech = null;
                 }
+            } else {
+                Log.e(TAG, "系统TTS初始化失败，status=" + status);
+                showToast("系统TTS初始化失败，请检查手机语音合成引擎");
             }
         });
+    }
+
+    private int chooseTtsLanguage() {
+        int result = textToSpeech.setLanguage(Locale.CHINA);
+        if (isTtsLanguageReady(result)) {
+            return result;
+        }
+        result = textToSpeech.setLanguage(Locale.SIMPLIFIED_CHINESE);
+        if (isTtsLanguageReady(result)) {
+            return result;
+        }
+        result = textToSpeech.setLanguage(Locale.CHINESE);
+        if (isTtsLanguageReady(result)) {
+            return result;
+        }
+        return textToSpeech.setLanguage(Locale.getDefault());
+    }
+
+    private boolean isTtsLanguageReady(int result) {
+        return result != TextToSpeech.LANG_MISSING_DATA
+                && result != TextToSpeech.LANG_NOT_SUPPORTED;
     }
 
     private void speakNavigationText(String text, boolean preempt) {
@@ -298,10 +341,12 @@ public final class NaviGuideActivity extends Activity {
             return;
         }
         if (textToSpeech == null || !ttsReady) {
+            Log.w(TAG, "系统TTS未就绪，暂存播报：" + text);
             pendingSpeech = text;
             pendingSpeechPreempt = preempt;
             return;
         }
+        Log.i(TAG, "系统TTS开始播报：" + text);
         textToSpeech.speak(
                 text,
                 preempt ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD,
@@ -330,6 +375,14 @@ public final class NaviGuideActivity extends Activity {
         }
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
         finish();
+    }
+
+    private void showToast(String message) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> showToast(message));
+            return;
+        }
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private String shortError(Throwable error) {

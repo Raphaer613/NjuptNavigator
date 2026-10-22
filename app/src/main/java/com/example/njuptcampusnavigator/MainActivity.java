@@ -5,8 +5,14 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.speech.tts.TextToSpeech;
 import android.view.Gravity;
 import android.view.View;
@@ -50,14 +56,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements SensorEventListener {
     private static final int LOCATION_REQUEST = 1001;
+    private static final long CURRENT_LOCATION_TIMEOUT_MS = 10000L;
+    private static final long CURRENT_LOCATION_RETRY_MS = 1000L;
     private static final String DEEP_LINK_SCHEME = "njuptnav";
     private static final String DEEP_LINK_PLACE_HOST = "place";
     private static final String BAIDU_URI_SOURCE = "andr.com.example.njuptcampusnavigator";
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final List<Place> places = CampusData.defaultPlaces();
     private LatLng currentPoint = CampusData.CAMPUS_CENTER;
+    private float currentAccuracy = 30f;
+    private float currentDirection;
     private Place selectedPlace;
     private CampusMapView mapView;
     private EditText searchInput;
@@ -72,6 +83,8 @@ public final class MainActivity extends Activity {
     private RoutePlanSearch routePlanSearch;
     private GeoCoder geoCoder;
     private TextToSpeech textToSpeech;
+    private SensorManager sensorManager;
+    private Sensor rotationSensor;
     private boolean ttsReady;
     private boolean lastRouteCycling;
     private String lastRouteSummary = "尚未规划路线";
@@ -82,6 +95,8 @@ public final class MainActivity extends Activity {
     private LatLng pendingRouteStartPoint;
     private LatLng pendingRouteEndPoint;
     private boolean routeReadyForNavigation;
+    private CoordinateCallback pendingCurrentLocationCallback;
+    private Runnable currentLocationRetryTask;
 
     private interface CoordinateCallback {
         void onResolved(LatLng point, String displayName);
@@ -133,7 +148,12 @@ public final class MainActivity extends Activity {
                 currentPoint = CampusData.SOUTH_GATE;
                 locationStatus.setText("检测到用户在校园外 · 已将当前位置设为南门");
             }
-            mapView.setCurrentPoint(currentPoint, location.getRadius(), location.getDirection());
+            currentAccuracy = location.getRadius();
+            if (location.getDirection() > 0) {
+                currentDirection = location.getDirection();
+            }
+            updateCurrentPointOnMap();
+            notifyFreshCurrentLocation();
         }
     };
 
@@ -205,6 +225,7 @@ public final class MainActivity extends Activity {
         geoCoder.setOnGetGeoCodeResultListener(geoCoderListener);
         buildScreen();
         setupTextToSpeech();
+        setupDirectionSensor();
         setupLocation();
         handleDeepLink(getIntent());
     }
@@ -258,7 +279,7 @@ public final class MainActivity extends Activity {
 
         mapView = new CampusMapView(this);
         mapView.setPlaces(places);
-        mapView.setCurrentPoint(currentPoint, 30f, 0f);
+        updateCurrentPointOnMap();
         mapView.setOnPlaceClickListener(this::selectPlace);
         LinearLayout.LayoutParams mapParams = new LinearLayout.LayoutParams(-1, 0, 1.6f);
         mapParams.setMargins(dp(16), 0, dp(16), dp(8));
@@ -277,8 +298,10 @@ public final class MainActivity extends Activity {
         currentButton.setTextColor(color("#2D7FF9"));
         currentButton.setOnClickListener(v -> {
             startInput.setText("当前位置");
-            routeStartPoint = currentPoint;
-            routeSummary.setText("起点已设为当前位置（校外时自动使用南门）");
+            routeStartPoint = null;
+            routeReadyForNavigation = false;
+            requestFreshCurrentLocation(null);
+            routeSummary.setText("起点已设为当前位置，规划路线时会重新获取实时定位");
         });
         LinearLayout.LayoutParams currentButtonParams = new LinearLayout.LayoutParams(dp(92), dp(46));
         currentButtonParams.setMargins(dp(8), 0, 0, 0);
@@ -576,7 +599,7 @@ public final class MainActivity extends Activity {
     private void resolveAddress(String text, boolean start, CoordinateCallback callback) {
         String value = text == null ? "" : text.trim();
         if (start && (value.isEmpty() || value.equals("当前位置"))) {
-            callback.onResolved(currentPoint, "当前位置");
+            requestFreshCurrentLocation(callback);
             return;
         }
 
@@ -686,6 +709,79 @@ public final class MainActivity extends Activity {
         startActivity(intent);
     }
 
+    private void requestFreshCurrentLocation(CoordinateCallback callback) {
+        if (currentLocationRetryTask != null) {
+            mainHandler.removeCallbacks(currentLocationRetryTask);
+            currentLocationRetryTask = null;
+        }
+        if (callback != null) {
+            pendingCurrentLocationCallback = callback;
+            long deadline = System.currentTimeMillis() + CURRENT_LOCATION_TIMEOUT_MS;
+            mainHandler.postDelayed(() -> {
+                if (pendingCurrentLocationCallback == callback) {
+                    pendingCurrentLocationCallback = null;
+                    if (currentLocationRetryTask != null) {
+                        mainHandler.removeCallbacks(currentLocationRetryTask);
+                        currentLocationRetryTask = null;
+                    }
+                    callback.onResolved(currentPoint, "当前位置");
+                    Toast.makeText(this, "实时定位暂未更新，已使用最近一次定位", Toast.LENGTH_SHORT).show();
+                }
+            }, CURRENT_LOCATION_TIMEOUT_MS);
+            currentLocationRetryTask = new Runnable() {
+                @Override
+                public void run() {
+                    if (pendingCurrentLocationCallback != callback) {
+                        return;
+                    }
+                    requestCurrentLocationOnce();
+                    if (System.currentTimeMillis() < deadline) {
+                        mainHandler.postDelayed(this, CURRENT_LOCATION_RETRY_MS);
+                    }
+                }
+            };
+        }
+        if (locationClient == null) {
+            if (currentLocationRetryTask != null) {
+                mainHandler.removeCallbacks(currentLocationRetryTask);
+                currentLocationRetryTask = null;
+            }
+            if (callback != null) {
+                pendingCurrentLocationCallback = null;
+                callback.onResolved(currentPoint, "当前位置");
+            }
+            return;
+        }
+        locationStatus.setText(callback == null ? "正在刷新当前位置..." : "正在刷新当前位置，最多等待10秒...");
+        requestCurrentLocationOnce();
+        if (currentLocationRetryTask != null) {
+            mainHandler.postDelayed(currentLocationRetryTask, CURRENT_LOCATION_RETRY_MS);
+        }
+    }
+
+    private void requestCurrentLocationOnce() {
+        if (locationClient == null) {
+            return;
+        }
+        try {
+            locationClient.requestLocation();
+        } catch (RuntimeException error) {
+        }
+    }
+
+    private void notifyFreshCurrentLocation() {
+        if (pendingCurrentLocationCallback == null) {
+            return;
+        }
+        CoordinateCallback callback = pendingCurrentLocationCallback;
+        pendingCurrentLocationCallback = null;
+        if (currentLocationRetryTask != null) {
+            mainHandler.removeCallbacks(currentLocationRetryTask);
+            currentLocationRetryTask = null;
+        }
+        callback.onResolved(currentPoint, "当前位置");
+    }
+
     private float distanceMeters(LatLng start, LatLng end) {
         double earthRadius = 6371000d;
         double startLat = Math.toRadians(start.latitude);
@@ -762,14 +858,29 @@ public final class MainActivity extends Activity {
         startBaiduLocation();
     }
 
+    private void setupDirectionSensor() {
+        sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (sensorManager != null) {
+            rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        }
+    }
+
+    private void updateCurrentPointOnMap() {
+        if (mapView != null) {
+            mapView.setCurrentPoint(currentPoint, currentAccuracy, currentDirection);
+        }
+    }
+
     private void startBaiduLocation() {
         try {
             locationClient = new LocationClient(getApplicationContext());
             LocationClientOption option = new LocationClientOption();
             option.setLocationMode(LocationClientOption.LocationMode.Hight_Accuracy);
             option.setCoorType("bd09ll");
-            option.setScanSpan(3000);
+            option.setScanSpan(1000);
             option.setOpenGps(true);
+            option.setLocationNotify(true);
+            option.setOpenAutoNotifyMode(1000, 1, LocationClientOption.LOC_SENSITIVITY_HIGHT);
             option.setIsNeedAddress(true);
             option.setNeedNewVersionRgc(true);
             locationClient.setLocOption(option);
@@ -803,14 +914,54 @@ public final class MainActivity extends Activity {
         if (mapView != null) {
             mapView.onResume();
         }
+        if (sensorManager != null && rotationSensor != null) {
+            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_UI);
+        }
+        restartLocationUpdates();
+        requestFreshCurrentLocation(null);
+    }
+
+    private void restartLocationUpdates() {
+        if (locationClient == null) {
+            return;
+        }
+        try {
+            locationClient.stop();
+            locationClient.start();
+        } catch (RuntimeException error) {
+        }
     }
 
     @Override
     protected void onPause() {
+        if (sensorManager != null) {
+            sensorManager.unregisterListener(this);
+        }
         if (mapView != null) {
             mapView.onPause();
         }
         super.onPause();
+    }
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) {
+            return;
+        }
+        float[] rotationMatrix = new float[9];
+        float[] orientationValues = new float[3];
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
+        SensorManager.getOrientation(rotationMatrix, orientationValues);
+        float azimuth = (float) Math.toDegrees(orientationValues[0]);
+        if (azimuth < 0) {
+            azimuth += 360f;
+        }
+        currentDirection = azimuth;
+        updateCurrentPointOnMap();
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
     }
 
     @Override
