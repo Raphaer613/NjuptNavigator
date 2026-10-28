@@ -83,6 +83,9 @@ public final class CampusMapView extends FrameLayout {
                 markerPlaces.put(marker, place);
             }
         }
+        if (selectedPlace != null && !places.contains(selectedPlace)) {
+            selectedPlace = null;
+        }
         if (selectedPlace != null) {
             setSelectedPlace(selectedPlace);
         }
@@ -120,7 +123,7 @@ public final class CampusMapView extends FrameLayout {
         routeOverlay = baiduMap.addOverlay(new PolylineOptions()
                 .points(new ArrayList<>(points))
                 .width(12)
-                .color(cycling ? Color.rgb(242, 138, 46) : Color.rgb(45, 127, 249))
+                .color(cycling ? Color.rgb(23, 138, 203) : Color.rgb(0, 104, 183))
                 .zIndex(20));
         baiduMap.animateMapStatus(MapStatusUpdateFactory.newLatLngZoom(points.get(points.size() - 1), 17.2f));
     }
@@ -139,5 +142,10 @@ public final class CampusMapView extends FrameLayout {
         activityIcon.recycle();
         selectedIcon.recycle();
         mapView.onDestroy();
+    }
+    public void centerOnCurrentPoint(LatLng point) {
+        baiduMap.animateMapStatus(
+                MapStatusUpdateFactory.newLatLngZoom(point, 17.0f)
+        );
     }
 }
