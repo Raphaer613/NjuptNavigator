@@ -1,13 +1,20 @@
 package com.example.njuptcampusnavigator;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
 import android.os.Message;
 import android.widget.LinearLayout;
 import android.media.AudioAttributes;
@@ -23,10 +30,14 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.graphics.Typeface;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.lang.reflect.Method;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,6 +62,11 @@ import com.baidu.mapapi.bikenavi.model.BikeRoutePlanError;
 import com.baidu.mapapi.bikenavi.params.BikeNaviLaunchParam;
 import com.baidu.mapapi.bikenavi.params.BikeRouteNodeInfo;
 import com.baidu.mapapi.model.LatLng;
+import com.baidu.mapapi.utils.CoordinateConverter;
+import com.baidu.location.BDAbstractLocationListener;
+import com.baidu.location.BDLocation;
+import com.baidu.location.LocationClient;
+import com.baidu.location.LocationClientOption;
 import com.baidu.mapapi.walknavi.adapter.IWEngineInitListener;
 import com.baidu.mapapi.walknavi.adapter.IWRoutePlanListener;
 import com.baidu.mapapi.walknavi.adapter.IWTTSPlayer;
@@ -59,6 +75,9 @@ import com.baidu.mapapi.walknavi.model.WalkNaviDisplayOption;
 import com.baidu.mapapi.walknavi.WalkNavigateHelper;
 import com.baidu.mapapi.walknavi.params.WalkRouteNodeInfo;
 import com.baidu.mapapi.walknavi.params.WalkNaviLaunchParam;
+import com.baidu.mapapi.bikenavi.adapter.IBNaviStatusListener;
+import com.baidu.mapapi.walknavi.adapter.IWNaviStatusListener;
+import com.baidu.platform.comapi.walknavi.WalkNaviModeSwitchListener;
 
 import java.util.Locale;
 
@@ -81,6 +100,7 @@ public final class NaviGuideActivity extends Activity {
     private String pendingSpeech;
     private boolean pendingSpeechPreempt;
     private boolean handOffToGuidePage;
+    private AlertDialog exitDialog;
     private TextView remainingInfo;
     private DirectionArrowView guideFallbackIcon;
     private TextView guideLabel;
@@ -88,11 +108,64 @@ public final class NaviGuideActivity extends Activity {
     private TextView guideSecondary;
     private boolean hasSdkGuideText;
     private boolean hasVoiceGuideText;
-    private final ArrayList<StepInfo> plannedSteps = new ArrayList<>();
-    private int plannedRouteDistance;
-    private int remainingMetres = -1;
-    private int lastPlannedSpeechStep = -1;
-    private int lastPlannedSpeechStage;
+    private int naviLocationCallbackCount;
+    private LocationClient guidanceLocationClient;
+    private LocationManager systemLocationManager;
+    private boolean baiduLocationSeen;
+    private boolean systemLocationSeen;
+    private LatLng recentGuidancePoint;
+    private float recentGuidanceAccuracy;
+    private String recentGuidanceSource;
+    private long recentGuidanceAt;
+    private final LocationListener systemLocationListener = new LocationListener() {
+        @Override public void onLocationChanged(Location location) {
+            if (location == null) return;
+            if (!systemLocationSeen) {
+                systemLocationSeen = true;
+                Log.i(TAG, "路线匹配收到系统定位，来源=" + location.getProvider()
+                        + "，精度=" + (location.hasAccuracy() ? location.getAccuracy() : "未知"));
+            }
+            if (!location.hasAccuracy() || !Float.isFinite(location.getAccuracy())) return;
+            long ageMs = (android.os.SystemClock.elapsedRealtimeNanos()
+                    - location.getElapsedRealtimeNanos()) / 1000000L;
+            if (ageMs < 0 || ageMs > 10000) return;
+            try {
+                LatLng gps = new LatLng(location.getLatitude(), location.getLongitude());
+                LatLng bd09 = new CoordinateConverter()
+                        .from(CoordinateConverter.CoordType.GPS).coord(gps).convert();
+                if (bd09 != null) updateGeometryGuidance(bd09, location.getAccuracy(),
+                        "系统" + location.getProvider());
+            } catch (RuntimeException error) {
+                Log.w(TAG, "系统定位坐标转换失败", error);
+            }
+        }
+        @Override public void onStatusChanged(String provider, int status, Bundle extras) { }
+        @Override public void onProviderEnabled(String provider) { }
+        @Override public void onProviderDisabled(String provider) {
+            Log.w(TAG, "路线匹配定位来源已关闭：" + provider);
+        }
+    };
+    private final ArrayList<LatLng> guidancePath = new ArrayList<>();
+    private final ArrayList<RouteTurn> guidanceTurns = new ArrayList<>();
+    private String guidanceRouteKey = "";
+    private double lastMatchedMetres = -1;
+    private long lastMatchedAt;
+    private int stableTurnFixes;
+    private int stableTurnIndex = -1;
+    private String lastGeometrySpeech = "";
+    private long lastGeometrySpeechAt;
+    private long lastGeometryDiagnosticAt;
+    private final BDAbstractLocationListener guidanceLocationListener = new BDAbstractLocationListener() {
+        @Override public void onReceiveLocation(BDLocation location) {
+            if (!baiduLocationSeen && location != null) {
+                baiduLocationSeen = true;
+                Log.i(TAG, "路线匹配收到百度定位，类型=" + location.getLocType()
+                        + "，精度=" + location.getRadius());
+            }
+            runOnUiThread(() -> updateGeometryGuidance(location));
+        }
+    };
+    private long lastSdkGuideTextAt;
     private View sdkNavigationView;
     private String lastNativePrompt = "";
     private volatile long lastRealtimeGuideAt;
@@ -122,10 +195,6 @@ public final class NaviGuideActivity extends Activity {
     private final Runnable rerouteStatusTimeout = () -> {
         if (rerouting && !arrived && !isFinishing() && !isDestroyed()) {
             rerouting = false;
-            plannedSteps.clear();
-            plannedRouteDistance = 0;
-            lastPlannedSpeechStep = -1;
-            lastPlannedSpeechStage = 0;
             showGuideStatus("转向提示暂未更新，请按地图路线行进");
             renderRemainingInfo();
             Log.w(TAG, "偏航后未收到完成或新指引回调；停止自定义重规划状态，等待 SDK 新指引");
@@ -317,6 +386,14 @@ public final class NaviGuideActivity extends Activity {
         try {
             walkHelper = WalkNavigateHelper.getInstance();
             applyWalkDisplayOption();
+            walkHelper.setWalkNaviStatusListener(new IWNaviStatusListener() {
+                @Override public void onWalkNaviModeChange(int mode, WalkNaviModeSwitchListener listener) {
+                    walkHelper.switchWalkNaviMode(NaviGuideActivity.this, mode, listener);
+                }
+                @Override public void onNaviExit() {
+                    runOnUiThread(() -> showExitConfirmation());
+                }
+            });
             walkHelper.setTTsPlayer(new IWTTSPlayer() {
                 @Override
                 public int playTTSText(String text, boolean preempt) {
@@ -333,6 +410,8 @@ public final class NaviGuideActivity extends Activity {
             walkHelper.setRouteGuidanceListener(this, walkRemainingListener);
             navigationStarted = true;
             walkHelper.startWalkNavi(this);
+            startGuidanceLocation();
+            scheduleRouteCapabilityProbe(navigationView);
         } catch (RuntimeException error) {
             Log.e(TAG, "步行导航页面启动异常", error);
             showFailure("步行导航页面启动失败：" + shortError(error));
@@ -344,10 +423,381 @@ public final class NaviGuideActivity extends Activity {
             WalkNaviDisplayOption option = new WalkNaviDisplayOption()
                     .showImageToAr(false)
                     .showTopGuideLayout(true)
+                    .showDialogWithExitNavi(false)
                     .setNaviTextTypeface(Typeface.create("sans-serif", Typeface.NORMAL))
                     .setAutoChangeNaviMode(false);
             walkHelper.setWalkNaviDisplayOption(option);
         }
+    }
+
+    // Diagnostic only: identify whether this installed BWNavi build exposes
+    // ordered geometry from the very route its navigation engine is following.
+    private void scheduleRouteCapabilityProbe(View navigationView) {
+        navigationView.postDelayed(this::logRouteCapabilities, 300L);
+        navigationView.postDelayed(this::logRouteCapabilities, 2500L);
+        navigationView.postDelayed(this::logRouteCapabilities, 12000L);
+        navigationView.postDelayed(() -> {
+            if (!isFinishing() && !isDestroyed() && !baiduLocationSeen && !systemLocationSeen) {
+                Log.w(TAG, "路线匹配无定位回调：百度与系统定位均未返回，请检查设备定位服务");
+            }
+        }, 9000L);
+    }
+
+    private void logRouteCapabilities() {
+        if (isFinishing() || isDestroyed()) return;
+        try {
+            Object result;
+            List<RouteInfo> routes;
+            List<?> positions;
+            if (cycling) {
+                BikeRouteResult bikeRoute = bikeHelper == null ? null : bikeHelper.getBikeNaviRouteInfo();
+                result = bikeRoute;
+                routes = bikeRoute == null ? null : bikeRoute.getRouteInfos();
+                positions = bikeRoute == null ? null : bikeRoute.getPositions();
+            } else {
+                WalkRouteResult walkRoute = walkHelper == null ? null : walkHelper.getWalkNaviRouteInfo();
+                result = walkRoute;
+                routes = walkRoute == null ? null : walkRoute.getRouteInfos();
+                positions = walkRoute == null ? null : walkRoute.getPositions();
+            }
+            Log.i(TAG, "路线能力：导航结果=" + (result == null ? "null" : result.getClass().getName())
+                    + "，路段数=" + (routes == null ? "null" : routes.size())
+                    + "，定位回调次数=" + naviLocationCallbackCount);
+            Object firstPosition = positions == null || positions.isEmpty() ? null : positions.get(0);
+            Object mapLocation = cycling
+                    ? bikeHelper == null || bikeHelper.getNaviMap() == null
+                        ? null : bikeHelper.getNaviMap().getMap().getLocationData()
+                    : walkHelper == null || walkHelper.getNaviMap() == null
+                        ? null : walkHelper.getNaviMap().getMap().getLocationData();
+            Log.i(TAG, "路线坐标核验：点数=" + (positions == null ? "null" : positions.size())
+                    + "，首点类型=" + (firstPosition == null ? "null" : firstPosition.getClass().getName())
+                    + "，导航地图定位=" + (mapLocation == null ? "null" : mapLocation.getClass().getName()));
+            prepareGeometryRoute(positions);
+            logRouteAccessorMethods("导航结果", result);
+            if (routes != null && !routes.isEmpty() && routes.get(0) != null) {
+                RouteInfo route = routes.get(0);
+                logRouteAccessorMethods("路段", route);
+                List<StepInfo> steps = route.getStepInfos();
+                Log.i(TAG, "路线能力：首路段步骤数=" + (steps == null ? "null" : steps.size()));
+                if (steps != null && !steps.isEmpty()) logRouteAccessorMethods("步骤", steps.get(0));
+            }
+        } catch (RuntimeException error) {
+            Log.w(TAG, "读取导航路线能力失败", error);
+        }
+    }
+
+    // The map's blue route is a separate view of this same SDK route. Match a
+    // fresh BD-09 location to its ordered geometry; never infer direction from
+    // remaining distance, compass orientation, or enum numeric values.
+    private static final class RouteTurn {
+        final int vertex;
+        final double metres;
+        final boolean left;
+        final double angle;
+        RouteTurn(int vertex, double metres, boolean left, double angle) {
+            this.vertex = vertex;
+            this.metres = metres;
+            this.left = left;
+            this.angle = angle;
+        }
+    }
+
+    private static final class RouteMatch {
+        final double metres;
+        final double offset;
+        RouteMatch(double metres, double offset) {
+            this.metres = metres;
+            this.offset = offset;
+        }
+    }
+
+    private void startGuidanceLocation() {
+        if (guidanceLocationClient != null || systemLocationManager != null) return;
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "路线匹配暂停：缺少精确定位权限");
+            return;
+        }
+        try {
+            systemLocationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+            if (systemLocationManager != null) {
+                boolean gps = systemLocationManager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+                boolean network = systemLocationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+                if (gps) systemLocationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER, 1000L, 0f,
+                        systemLocationListener, Looper.getMainLooper());
+                if (network) systemLocationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER, 2000L, 0f,
+                        systemLocationListener, Looper.getMainLooper());
+                Log.i(TAG, "路线匹配系统定位已订阅，GPS=" + gps + "，网络=" + network);
+            }
+        } catch (SecurityException | IllegalArgumentException error) {
+            Log.w(TAG, "路线匹配系统定位不可用", error);
+            systemLocationManager = null;
+        }
+        try {
+            guidanceLocationClient = new LocationClient(getApplicationContext());
+            LocationClientOption option = new LocationClientOption();
+            option.setLocationMode(LocationClientOption.LocationMode.Hight_Accuracy);
+            option.setCoorType("bd09ll");
+            option.setScanSpan(1000);
+            option.setOpenGps(true);
+            option.setLocationNotify(true);
+            option.setIsNeedAddress(false);
+            guidanceLocationClient.setLocOption(option);
+            guidanceLocationClient.registerLocationListener(guidanceLocationListener);
+            guidanceLocationClient.start();
+            Log.i(TAG, "路线匹配定位已启动（bd09ll）");
+        } catch (Exception error) {
+            Log.e(TAG, "路线匹配定位启动失败", error);
+            if (guidanceLocationClient != null) {
+                try { guidanceLocationClient.stop(); } catch (RuntimeException ignored) { }
+                guidanceLocationClient = null;
+            }
+        }
+    }
+
+    private void stopGuidanceLocation() {
+        if (systemLocationManager != null) {
+            try {
+                systemLocationManager.removeUpdates(systemLocationListener);
+            } catch (SecurityException error) {
+                Log.w(TAG, "停止系统定位监听失败", error);
+            }
+            systemLocationManager = null;
+        }
+        if (guidanceLocationClient != null) {
+            try {
+                guidanceLocationClient.unRegisterLocationListener(guidanceLocationListener);
+                guidanceLocationClient.stop();
+            } catch (RuntimeException error) {
+                Log.w(TAG, "停止百度路线匹配定位失败", error);
+            }
+            guidanceLocationClient = null;
+        }
+    }
+
+    private void prepareGeometryRoute(List<?> positions) {
+        if (positions == null || positions.size() < 3
+                || !(positions.get(0) instanceof LatLng)
+                || !(positions.get(positions.size() - 1) instanceof LatLng)) return;
+        LatLng first = (LatLng) positions.get(0);
+        LatLng last = (LatLng) positions.get(positions.size() - 1);
+        String key = positions.size() + ":" + first.latitude + ":" + first.longitude
+                + ":" + last.latitude + ":" + last.longitude;
+        if (key.equals(guidanceRouteKey)) return;
+        ArrayList<LatLng> points = new ArrayList<>();
+        for (Object item : positions) {
+            if (!(item instanceof LatLng)) return;
+            LatLng point = (LatLng) item;
+            if (points.isEmpty() || metresBetween(points.get(points.size() - 1), point) > 0.6) {
+                points.add(point);
+            }
+        }
+        if (points.size() < 3) return;
+        double forward = metresBetween(points.get(0), startPoint())
+                + metresBetween(points.get(points.size() - 1), endPoint());
+        double reverse = metresBetween(points.get(0), endPoint())
+                + metresBetween(points.get(points.size() - 1), startPoint());
+        if (reverse < forward) Collections.reverse(points);
+        double startGap = metresBetween(points.get(0), startPoint());
+        double endGap = metresBetween(points.get(points.size() - 1), endPoint());
+        if (startGap > 90 || endGap > 90) {
+            Log.w(TAG, "路线匹配暂停：路线端点与规划端点不一致，起="
+                    + Math.round(startGap) + "米，终=" + Math.round(endGap) + "米");
+            return;
+        }
+        guidancePath.clear();
+        guidancePath.addAll(points);
+        guidanceTurns.clear();
+        double[] cumulative = new double[points.size()];
+        for (int i = 1; i < points.size(); i++) {
+            cumulative[i] = cumulative[i - 1] + metresBetween(points.get(i - 1), points.get(i));
+        }
+        for (int i = 1; i + 1 < points.size(); i++) {
+            // Look around each vertex rather than using two very short shape points.
+            int before = i - 1, after = i + 1;
+            while (before > 0 && cumulative[i] - cumulative[before] < 10) before--;
+            while (after < points.size() - 1 && cumulative[after] - cumulative[i] < 10) after++;
+            if (cumulative[i] - cumulative[before] < 7 || cumulative[after] - cumulative[i] < 7) continue;
+            double scale = Math.cos(Math.toRadians(points.get(i).latitude));
+            double ax = (points.get(i).longitude - points.get(before).longitude) * scale;
+            double ay = points.get(i).latitude - points.get(before).latitude;
+            double bx = (points.get(after).longitude - points.get(i).longitude) * scale;
+            double by = points.get(after).latitude - points.get(i).latitude;
+            double cross = ax * by - ay * bx;
+            double dot = ax * bx + ay * by;
+            double angle = Math.toDegrees(Math.atan2(Math.abs(cross), dot));
+            if (angle < 58 || angle > 155) continue;
+            RouteTurn turn = new RouteTurn(i, cumulative[i], cross > 0, angle);
+            if (!guidanceTurns.isEmpty()
+                    && turn.metres - guidanceTurns.get(guidanceTurns.size() - 1).metres < 12) {
+                int lastIndex = guidanceTurns.size() - 1;
+                if (angle > guidanceTurns.get(lastIndex).angle) guidanceTurns.set(lastIndex, turn);
+            } else {
+                guidanceTurns.add(turn);
+            }
+        }
+        guidanceRouteKey = key;
+        lastMatchedMetres = -1;
+        stableTurnIndex = -1;
+        stableTurnFixes = 0;
+        lastGeometrySpeech = "";
+        Log.i(TAG, "路线匹配就绪：点数=" + points.size() + "，里程="
+                + Math.round(cumulative[cumulative.length - 1]) + "米，明显转向=" + guidanceTurns.size());
+        if (recentGuidancePoint != null
+                && android.os.SystemClock.elapsedRealtime() - recentGuidanceAt < 10000L) {
+            Log.i(TAG, "路线就绪，使用刚收到的实时定位尝试匹配");
+            updateGeometryGuidance(recentGuidancePoint, recentGuidanceAccuracy, recentGuidanceSource);
+        }
+        if (guidanceLocationClient != null) {
+            try {
+                guidanceLocationClient.requestLocation();
+                Log.i(TAG, "路线就绪，主动请求下一次百度定位");
+            } catch (RuntimeException error) {
+                Log.w(TAG, "主动请求定位失败", error);
+            }
+        }
+    }
+
+    private static double metresBetween(LatLng a, LatLng b) {
+        double north = Math.toRadians(b.latitude - a.latitude) * 6371000;
+        double east = Math.toRadians(b.longitude - a.longitude) * 6371000
+                * Math.cos(Math.toRadians((a.latitude + b.latitude) / 2));
+        return Math.hypot(north, east);
+    }
+
+    private RouteMatch matchPosition(LatLng position) {
+        double bestOffset = Double.MAX_VALUE, bestMetres = 0;
+        double otherOffset = Double.MAX_VALUE, otherMetres = 0;
+        double cumulative = 0;
+        double cos = Math.cos(Math.toRadians(position.latitude));
+        for (int i = 1; i < guidancePath.size(); i++) {
+            LatLng a = guidancePath.get(i - 1), b = guidancePath.get(i);
+            double ax = Math.toRadians(a.longitude - position.longitude) * 6371000 * cos;
+            double ay = Math.toRadians(a.latitude - position.latitude) * 6371000;
+            double bx = Math.toRadians(b.longitude - a.longitude) * 6371000 * cos;
+            double by = Math.toRadians(b.latitude - a.latitude) * 6371000;
+            double lengthSquared = bx * bx + by * by;
+            if (lengthSquared < 0.1) continue;
+            double t = Math.max(0, Math.min(1, -(ax * bx + ay * by) / lengthSquared));
+            double offset = Math.hypot(ax + t * bx, ay + t * by);
+            double along = cumulative + t * Math.sqrt(lengthSquared);
+            if (offset < bestOffset) {
+                otherOffset = bestOffset; otherMetres = bestMetres;
+                bestOffset = offset; bestMetres = along;
+            } else if (offset < otherOffset && Math.abs(along - bestMetres) > 35) {
+                otherOffset = offset; otherMetres = along;
+            }
+            cumulative += metresBetween(a, b);
+        }
+        // Parallel/looping roads can be indistinguishable at GPS accuracy.
+        if (otherOffset - bestOffset < 5 && Math.abs(otherMetres - bestMetres) > 35) return null;
+        return bestOffset == Double.MAX_VALUE ? null : new RouteMatch(bestMetres, bestOffset);
+    }
+
+    private void updateGeometryGuidance(BDLocation location) {
+        if (location == null) return;
+        if (location.getLocType() != 61 && location.getLocType() != 161) {
+            logGeometryStatus("百度定位类型=" + location.getLocType());
+            return;
+        }
+        float accuracy = location.getRadius();
+        if (!Float.isFinite(accuracy) || accuracy <= 0) {
+            logGeometryStatus("百度定位精度无效=" + accuracy);
+            return;
+        }
+        LatLng point = new LatLng(location.getLatitude(), location.getLongitude());
+        updateGeometryGuidance(point, accuracy, "百度");
+    }
+
+    private void updateGeometryGuidance(LatLng point, float accuracy, String source) {
+        if (point != null && Float.isFinite(accuracy) && accuracy > 0) {
+            recentGuidancePoint = point;
+            recentGuidanceAccuracy = accuracy;
+            recentGuidanceSource = source;
+            recentGuidanceAt = android.os.SystemClock.elapsedRealtime();
+        }
+        if (!navigationStarted || arrived || rerouting || awaitingGuideAfterYaw
+                || isFinishing() || isDestroyed() || point == null || guidancePath.isEmpty()) return;
+        // SDK instructions, when available, always outrank geometry estimates.
+        if ((hasSdkGuideText && android.os.SystemClock.elapsedRealtime() - lastSdkGuideTextAt < 20000)
+                || (hasVoiceGuideText && android.os.SystemClock.elapsedRealtime() - lastRealtimeGuideAt < 20000)) return;
+        if (!Float.isFinite(accuracy) || accuracy <= 0 || accuracy > 35) {
+            logGeometryStatus(source + "定位精度=" + accuracy + "米");
+            return;
+        }
+        if (point.latitude == 0 || point.longitude == 0) return;
+        RouteMatch match = matchPosition(point);
+        if (match == null || match.offset > Math.min(40, Math.max(15, accuracy * 1.4))) {
+            logGeometryStatus(source + "未匹配路线，距离="
+                    + (match == null ? "多路径歧义" : Math.round(match.offset) + "米"));
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (lastMatchedMetres >= 0 && now - lastMatchedAt < 10000
+                && (match.metres < lastMatchedMetres - 18
+                    || match.metres > lastMatchedMetres + (cycling ? 80 : 45))) {
+            logGeometryStatus(source + "定位跳变，进度=" + Math.round(match.metres) + "米");
+            return;
+        }
+        lastMatchedMetres = match.metres;
+        lastMatchedAt = now;
+        RouteTurn next = null;
+        for (RouteTurn turn : guidanceTurns) {
+            if (turn.metres >= match.metres - 4) { next = turn; break; }
+        }
+        int turnIndex = next == null ? -1 : next.vertex;
+        if (turnIndex == stableTurnIndex) stableTurnFixes++;
+        else { stableTurnIndex = turnIndex; stableTurnFixes = 1; }
+        logGeometryStatus(source + "匹配进度=" + Math.round(match.metres) + "米，偏移="
+                + Math.round(match.offset) + "米，下次转弯="
+                + (next == null ? "无" : Math.round(next.metres - match.metres) + "米"
+                    + (next.left ? "左" : "右")));
+        // A precise GPS fix can be used immediately; network fixes need a
+        // second independent observation before announcing a direction.
+        if (stableTurnFixes < 2
+                && !(source.contains("gps") && accuracy <= 12 && match.offset <= 8)) return;
+        if (next == null || next.metres - match.metres > (cycling ? 150 : 110)) {
+            renderGuide("沿规划路线行进", "以地图蓝色路线为准");
+            return;
+        }
+        int distance = Math.max(0, (int) Math.round(next.metres - match.metres));
+        String instruction = "前方" + distance + "米" + (next.left ? "左转" : "右转");
+        renderGuide(instruction, "沿地图蓝色路线行进");
+        int stage = distance <= (cycling ? 25 : 18) ? 2
+                : distance <= (cycling ? 80 : 55) ? 1 : 0;
+        String speechKey = guidanceRouteKey + ":" + next.vertex + ":" + stage;
+        if (stage > 0 && !speechKey.equals(lastGeometrySpeech)
+                && now - lastGeometrySpeechAt >= 12000) {
+            lastGeometrySpeech = speechKey;
+            lastGeometrySpeechAt = now;
+            Log.i(TAG, "路线匹配播报：" + instruction + "，来源=" + source
+                    + "，偏移=" + Math.round(match.offset)
+                    + "米，精度=" + Math.round(accuracy) + "米");
+            speakNavigationText(instruction, true);
+        }
+    }
+
+    private void logGeometryStatus(String status) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastGeometryDiagnosticAt < 12000) return;
+        lastGeometryDiagnosticAt = now;
+        Log.i(TAG, "路线匹配状态：" + status);
+    }
+
+    private void logRouteAccessorMethods(String label, Object source) {
+        if (source == null) return;
+        StringBuilder methods = new StringBuilder();
+        for (Method method : source.getClass().getMethods()) {
+            String name = method.getName();
+            if (method.getParameterTypes().length != 0 || !name.startsWith("get")
+                    || name.equals("getClass")) continue;
+            if (methods.length() > 0) methods.append(", ");
+            methods.append(name).append(':').append(method.getReturnType().getSimpleName());
+            if (methods.length() > 1400) break;
+        }
+        Log.i(TAG, "路线能力：" + label + "接口=" + methods);
     }
 
     private void startBikeGuidePage() {
@@ -355,7 +805,13 @@ public final class NaviGuideActivity extends Activity {
             bikeHelper = BikeNavigateHelper.getInstance();
             bikeHelper.setBikeNaviDisplayOption(new BikeNaviDisplayOption()
                     .showTopGuideLayout(true)
+                    .showDialogEnable(false)
                     .setNaviTextTypeface(Typeface.create("sans-serif", Typeface.NORMAL)));
+            bikeHelper.setBikeNaviStatusListener(new IBNaviStatusListener() {
+                @Override public void onNaviExit() {
+                    runOnUiThread(() -> showExitConfirmation());
+                }
+            });
             bikeHelper.setTTsPlayer(new IBTTSPlayer() {
                 @Override
                 public int playTTSText(String text, boolean preempt) {
@@ -372,6 +828,8 @@ public final class NaviGuideActivity extends Activity {
             bikeHelper.setRouteGuidanceListener(this, bikeRemainingListener);
             navigationStarted = true;
             bikeHelper.startBikeNavi(this);
+            startGuidanceLocation();
+            scheduleRouteCapabilityProbe(navigationView);
         } catch (RuntimeException error) {
             Log.e(TAG, "骑行导航页面启动异常", error);
             showFailure("骑行导航页面启动失败：" + shortError(error));
@@ -442,6 +900,25 @@ public final class NaviGuideActivity extends Activity {
         FrameLayout navigationArea = new FrameLayout(this);
         navigationArea.addView(navigationView, new FrameLayout.LayoutParams(-1, -1));
         navigationArea.addView(guideCard, cardParams);
+        // Put our own exit control above the SDK's bottom-left exit target.
+        // The SDK's default dialog varies by version; this button always uses our dialog.
+        TextView appExitButton = new TextView(this);
+        appExitButton.setText("×\n退出");
+        appExitButton.setTextSize(15);
+        appExitButton.setTextColor(Color.rgb(11, 61, 99));
+        appExitButton.setGravity(Gravity.CENTER);
+        appExitButton.setContentDescription("退出导航");
+        GradientDrawable exitSurface = new GradientDrawable();
+        exitSurface.setColor(Color.WHITE);
+        exitSurface.setCornerRadius(dp(12));
+        exitSurface.setStroke(dp(1), Color.rgb(217, 229, 240));
+        appExitButton.setBackground(exitSurface);
+        appExitButton.setElevation(dp(5));
+        appExitButton.setOnClickListener(v -> showExitConfirmation());
+        FrameLayout.LayoutParams appExitParams = new FrameLayout.LayoutParams(
+                dp(78), dp(70), Gravity.BOTTOM | Gravity.START);
+        appExitParams.setMargins(dp(8), 0, 0, dp(8));
+        navigationArea.addView(appExitButton, appExitParams);
         root.addView(navigationArea, new LinearLayout.LayoutParams(-1, 0, 1));
         remainingInfo = new TextView(this);
         remainingInfo.setTextColor(Color.rgb(11, 61, 99));
@@ -454,6 +931,7 @@ public final class NaviGuideActivity extends Activity {
         root.addView(remainingInfo, new LinearLayout.LayoutParams(-1, -2));
         renderRemainingInfo();
         setContentView(root);
+        Log.i(TAG, "自定义导航退出按钮和确认框已装载，模式=" + (cycling ? "骑行" : "步行"));
         root.requestApplyInsets();
         mirroringNativeGuide = true;
         navigationView.post(nativeGuideMirror);
@@ -485,19 +963,17 @@ public final class NaviGuideActivity extends Activity {
     }
 
     private void updateRemainingInfo(CharSequence distance, CharSequence time) {
-        // Preserve the SDK's formatted text for display; parse units only for route-step fallback.
+        // Keep the SDK remaining distance for display; never infer a turn from it.
         final String distanceText = distance == null ? null : distance.toString().trim();
         final String timeText = time == null ? null : time.toString().trim();
         runOnUiThread(() -> {
             if (isFinishing() || isDestroyed() || arrived) return;
             if (distanceText != null && !distanceText.isEmpty()) remainingDistance = distanceText;
-            if (distanceText != null) remainingMetres = parseDistanceMetres(distanceText);
             if (timeText != null && !timeText.isEmpty()) remainingTime = timeText;
             if (distanceText != null && !distanceText.isEmpty()) {
                 lastRemainingUpdateAt = android.os.SystemClock.elapsedRealtime();
             }
             renderRemainingInfo();
-            if (!rerouting) maybeShowPlannedGuide();
         });
     }
 
@@ -523,13 +999,10 @@ public final class NaviGuideActivity extends Activity {
             }
             reroutingStartedAt = 0L;
             awaitingGuideAfterYaw = false;
-            plannedSteps.clear();
-            plannedRouteDistance = 0;
-            lastPlannedSpeechStep = -1;
-            lastPlannedSpeechStage = 0;
             showGuideStatus("正在获取新的路线指引…");
             hasSdkGuideText = false;
             hasVoiceGuideText = false;
+            lastSdkGuideTextAt = 0L;
             lastNativePrompt = "";
             lastRealtimeGuideAt = 0L;
             lastSpokenManeuver = "";
@@ -537,6 +1010,13 @@ public final class NaviGuideActivity extends Activity {
             lastManeuverStage = 0;
             renderRemainingInfo();
             Log.i(TAG, "重新规划完成，恢复自定义导航界面");
+            if (sdkNavigationView != null) sdkNavigationView.postDelayed(this::logRouteCapabilities, 2500L);
+            guidanceRouteKey = "";
+            guidancePath.clear();
+            guidanceTurns.clear();
+            lastMatchedMetres = -1;
+            stableTurnIndex = -1;
+            stableTurnFixes = 0;
         });
     }
 
@@ -567,14 +1047,11 @@ public final class NaviGuideActivity extends Activity {
                 awaitingGuideAfterYaw = false;
                 reroutingStartedAt = 0L;
                 if (sdkNavigationView != null) sdkNavigationView.removeCallbacks(rerouteStatusTimeout);
-                plannedSteps.clear();
-                plannedRouteDistance = 0;
-                lastPlannedSpeechStep = -1;
-                lastPlannedSpeechStage = 0;
                 renderRemainingInfo();
                 Log.i(TAG, "收到新导航提示，恢复偏航后的自定义界面：" + candidate);
             }
             hasSdkGuideText = true;
+            lastSdkGuideTextAt = android.os.SystemClock.elapsedRealtime();
             lastRealtimeGuideAt = android.os.SystemClock.elapsedRealtime();
             guideLabel.setText(cycling ? "骑行导航" : "步行导航");
             // Baidu often splits “沿道路 / 向东出发” across two callbacks fields.
@@ -631,15 +1108,12 @@ public final class NaviGuideActivity extends Activity {
         // The SDK can attach its top panel to the Activity rather than the returned map View.
         collectNativeGuideTexts(getWindow().getDecorView(), origin[1], texts);
         if (texts.isEmpty()) {
-            maybeShowPlannedGuide();
             long now = android.os.SystemClock.elapsedRealtime();
             if (now - lastGuideDiagnosticAt > 10000) {
                 lastGuideDiagnosticAt = now;
                 Log.i(TAG, "诱导状态：模式=" + (cycling ? "骑行" : "步行")
                         + "，原生提示=0，文字回调=" + hasSdkGuideText
-                        + "，语音回调=" + hasVoiceGuideText
-                        + "，规划路段=" + plannedSteps.size()
-                        + "，剩余米数=" + remainingMetres);
+                        + "，语音回调=" + hasVoiceGuideText);
             }
             return;
         }
@@ -702,134 +1176,6 @@ public final class NaviGuideActivity extends Activity {
         }
     }
 
-    private void loadPlannedSteps() {
-        if (!plannedSteps.isEmpty()) return;
-        try {
-            List<RouteInfo> routes = null;
-            int reportedDistance = 0;
-            if (cycling && bikeHelper != null) {
-                BikeRouteResult result = bikeHelper.getBikeNaviRouteInfo();
-                if (result != null) {
-                    routes = result.getRouteInfos();
-                    reportedDistance = result.getDistance();
-                }
-                if ((routes == null || routes.isEmpty()) && bikeHelper.getBikePlanRoute() != null
-                        && !bikeHelper.getBikePlanRoute().isEmpty()) {
-                    BikeRouteResult plan = bikeHelper.getBikePlanRoute().get(0);
-                    routes = plan.getRouteInfos();
-                    reportedDistance = plan.getDistance();
-                }
-            } else if (walkHelper != null) {
-                WalkRouteResult result = walkHelper.getWalkNaviRouteInfo();
-                if (result != null) {
-                    routes = result.getRouteInfos();
-                    reportedDistance = result.getDistance();
-                }
-                if ((routes == null || routes.isEmpty()) && walkHelper.getWalkPlanRoute() != null
-                        && !walkHelper.getWalkPlanRoute().isEmpty()) {
-                    WalkRouteResult plan = walkHelper.getWalkPlanRoute().get(0);
-                    routes = plan.getRouteInfos();
-                    reportedDistance = plan.getDistance();
-                }
-            }
-            if (routes == null) return;
-            for (RouteInfo route : routes) {
-                if (route == null || route.getStepInfos() == null) continue;
-                for (StepInfo step : route.getStepInfos()) {
-                    if (step != null && step.getDistance() > 0) {
-                        plannedSteps.add(step);
-                        plannedRouteDistance += step.getDistance();
-                    }
-                }
-            }
-            if (reportedDistance > 0 && Math.abs(plannedRouteDistance - reportedDistance)
-                    > Math.max(80, reportedDistance / 4)) {
-                Log.w(TAG, "规划路段长度与路线总长不一致：" + plannedRouteDistance
-                        + "/" + reportedDistance);
-                plannedSteps.clear();
-                plannedRouteDistance = 0;
-                return;
-            }
-            if (!plannedSteps.isEmpty()) {
-                Log.i(TAG, "读取规划路段：" + plannedSteps.size() + "段，" + plannedRouteDistance + "米");
-                for (int i = 0; i < plannedSteps.size(); i++) {
-                    StepInfo step = plannedSteps.get(i);
-                    Log.i(TAG, "规划路段" + i + "：距离=" + step.getDistance()
-                            + "米，方向=" + step.getGuideKind() + "，道路=" + step.getRoadName());
-                }
-            }
-        } catch (RuntimeException error) {
-            Log.w(TAG, "读取规划路段失败", error);
-        }
-    }
-
-    private void maybeShowPlannedGuide() {
-        if (arrived || rerouting || awaitingGuideAfterYaw || guidePrimary == null
-                || android.os.SystemClock.elapsedRealtime() - lastRealtimeGuideAt < 15000L) return;
-        loadPlannedSteps();
-        if (plannedSteps.isEmpty() || remainingMetres < 0 || plannedRouteDistance <= 0
-                || remainingMetres > plannedRouteDistance + 80) return;
-        int travelled = Math.max(0, plannedRouteDistance - remainingMetres);
-        int endOfStep = 0;
-        for (int i = 0; i < plannedSteps.size(); i++) {
-            StepInfo step = plannedSteps.get(i);
-            endOfStep += step.getDistance();
-            if (travelled >= endOfStep && i < plannedSteps.size() - 1) continue;
-            String road = step.getRoadName() == null ? "当前道路" : step.getRoadName().trim();
-            if (road.isEmpty()) road = "当前道路";
-            String title = "沿" + road + "前行";
-            String detail = "路线规划参考";
-            String action = "";
-            int distanceToTurn = -1;
-            if (i + 1 < plannedSteps.size()) {
-                StepInfo next = plannedSteps.get(i + 1);
-                action = plannedAction(next.getGuideKind() == null ? "" : next.getGuideKind().name());
-                if (!action.isEmpty()) {
-                    distanceToTurn = Math.max(0, endOfStep - travelled);
-                    title = "前方" + distanceToTurn + "米" + action;
-                    String nextRoad = next.getRoadName();
-                    detail = nextRoad == null || nextRoad.trim().isEmpty()
-                            ? "沿规划路线行进" : "进入" + nextRoad.trim();
-                }
-            }
-            guideLabel.setText("路线规划提示");
-            renderGuide(title, detail);
-            maybeSpeakPlannedTurn(i, action, distanceToTurn, title);
-            return;
-        }
-    }
-
-    private void maybeSpeakPlannedTurn(int stepIndex, String action, int distance, String prompt) {
-        if (distance < 0 || !(action.contains("左转") || action.contains("右转")
-                || action.contains("掉头"))) return;
-        int stage = distance <= (cycling ? 30 : 20) ? 2
-                : distance <= (cycling ? 100 : 70) ? 1 : 0;
-        if (stage == 0 || stepIndex == lastPlannedSpeechStep
-                && stage <= lastPlannedSpeechStage) return;
-        lastPlannedSpeechStep = stepIndex;
-        lastPlannedSpeechStage = stage;
-        Log.i(TAG, "规划路线临近转弯：路段=" + stepIndex + "，距离=" + distance
-                + "，方向=" + action + "，阶段=" + stage);
-        speakNavigationText(prompt, true);
-    }
-
-    private String plannedAction(String kind) {
-        if (kind.contains("Dest")) return "到达目的地";
-        if (kind.startsWith("NE_WTT_NAV_TURN_LEFT")) return "左转";
-        if (kind.startsWith("NE_WTT_NAV_TURN_RIGHT")) return "右转";
-        if (kind.startsWith("NE_WTT_NAV_STRAIGHT")) return "直行";
-        if (kind.contains("UTurn")) return "掉头";
-        if (kind.contains("_Left_PassRoad") || kind.contains("_Goto_Left_Road")) return "左转";
-        if (kind.contains("_Right_PassRoad") || kind.contains("_Goto_Right_Road")) return "右转";
-        if (kind.endsWith("_Front_Straight")) return "直行";
-        if (kind.endsWith("_Right") || kind.endsWith("_Right_Front")
-                || kind.endsWith("_Right_Back")) return "右转";
-        if (kind.endsWith("_Left") || kind.endsWith("_Left_Front")
-                || kind.endsWith("_Left_Back")) return "左转";
-        if (kind.endsWith("_Front")) return "直行";
-        return "";
-    }
-
     private boolean hasManeuver(String text) {
         return text.contains("转") || text.contains("直行") || text.contains("出发")
                 || text.contains("继续") || text.contains("到达");
@@ -858,9 +1204,12 @@ public final class NaviGuideActivity extends Activity {
 
     private void updateVoiceGuide(String text) {
         runOnUiThread(() -> {
-            if (!isFinishing() && !isDestroyed() && !arrived && !rerouting
-                    && !hasSdkGuideText && guidePrimary != null) {
-                hasVoiceGuideText = true;
+            if (isFinishing() || isDestroyed() || arrived || rerouting) return;
+            hasVoiceGuideText = true;
+            // A previous text callback may stop updating while TTS continues.
+            // Prefer fresh on-screen guidance, then mirror the SDK's own speech text.
+            if (guidePrimary != null && android.os.SystemClock.elapsedRealtime()
+                    - lastSdkGuideTextAt > 2000L) {
                 guideLabel.setText(cycling ? "骑行导航" : "步行导航");
                 renderGuide(text.trim(), "");
             }
@@ -969,15 +1318,21 @@ public final class NaviGuideActivity extends Activity {
             updateRerouting(true);
         }
         @Override public void onReRouteComplete() { updateRerouting(false); }
-        @Override public void onRouteGuideIconUpdate(Drawable icon) { }
-        @Override public void onRouteGuideKind(RouteGuideKind kind) { }
+        @Override public void onRouteGuideIconUpdate(Drawable icon) {
+            Log.i(TAG, (cycling ? "骑行" : "步行") + "原生图标回调：" + (icon != null));
+        }
+        @Override public void onRouteGuideKind(RouteGuideKind kind) {
+            Log.i(TAG, (cycling ? "骑行" : "步行") + "原生转向类型回调：" + kind);
+        }
         @Override public void onRoadGuideTextUpdate(CharSequence first, CharSequence second) {
             Log.i(TAG, "步行文字回调：" + first + " / " + second);
             updateGuideText(first, second);
         }
         @Override public void onGpsStatusChange(CharSequence text, Drawable icon) { }
         @Override public void onVibrate() { }
-        @Override public void onNaviLocationUpdate() { }
+        @Override public void onNaviLocationUpdate() {
+            if (++naviLocationCallbackCount == 1) Log.i(TAG, "步行导航收到首次位置更新");
+        }
         @Override public void onSimpleMapInfoUpdate(WalkSimpleMapInfo info) { }
         @Override public void onRouteGuideIconInfoUpdate(IWRouteIconInfo info) { }
         @Override public void onFinalEnd(Message message) { showArrival(); }
@@ -1007,8 +1362,12 @@ public final class NaviGuideActivity extends Activity {
             updateRerouting(true);
         }
         @Override public void onReRouteComplete() { updateRerouting(false); }
-        @Override public void onRouteGuideIconUpdate(Drawable icon) { }
-        @Override public void onRouteGuideKind(RouteGuideKind kind) { }
+        @Override public void onRouteGuideIconUpdate(Drawable icon) {
+            Log.i(TAG, (cycling ? "骑行" : "步行") + "原生图标回调：" + (icon != null));
+        }
+        @Override public void onRouteGuideKind(RouteGuideKind kind) {
+            Log.i(TAG, (cycling ? "骑行" : "步行") + "原生转向类型回调：" + kind);
+        }
         @Override public void onRoadGuideTextUpdate(CharSequence first, CharSequence second) {
             Log.i(TAG, "骑行文字回调：" + first + " / " + second);
             updateGuideText(first, second);
@@ -1017,7 +1376,9 @@ public final class NaviGuideActivity extends Activity {
         @Override public void onVibrate() { }
         @Override public void onRouteGuideIconInfoUpdate(IBRouteIconInfo info) { }
         @Override public void onGetRouteDetailInfo(BikeRouteDetailInfo info) { }
-        @Override public void onNaviLocationUpdate() { }
+        @Override public void onNaviLocationUpdate() {
+            if (++naviLocationCallbackCount == 1) Log.i(TAG, "骑行导航收到首次位置更新");
+        }
     }
 
     private String formatDistance(int distanceMetres) {
@@ -1098,6 +1459,7 @@ public final class NaviGuideActivity extends Activity {
     private void speakSdkNavigationText(String text, boolean preempt) {
         if (text == null || text.trim().isEmpty()) return;
         lastRealtimeGuideAt = android.os.SystemClock.elapsedRealtime();
+        updateVoiceGuide(text);
         // SDK speech is another source of fresh guidance when the text callback is absent.
         if (hasManeuver(text) && !text.contains("偏离") && !text.contains("重新规划")) {
             runOnUiThread(() -> {
@@ -1105,8 +1467,6 @@ public final class NaviGuideActivity extends Activity {
                 rerouting = false;
                 awaitingGuideAfterYaw = false;
                 reroutingStartedAt = 0L;
-                plannedSteps.clear();
-                plannedRouteDistance = 0;
                 if (sdkNavigationView != null) sdkNavigationView.removeCallbacks(rerouteStatusTimeout);
                 renderRemainingInfo();
                 Log.i(TAG, "收到 SDK 新语音指引，恢复偏航后的提示：" + text);
@@ -1120,7 +1480,6 @@ public final class NaviGuideActivity extends Activity {
             return;
         }
         Log.d(TAG, "收到导航语音提示：" + text);
-        updateVoiceGuide(text);
         if (textToSpeech == null || !ttsReady) {
             Log.w(TAG, "系统TTS未就绪，暂存播报：" + text);
             pendingSpeech = text;
@@ -1170,6 +1529,107 @@ public final class NaviGuideActivity extends Activity {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
+    private void showExitConfirmation() {
+        Log.i(TAG, "打开应用自定义退出导航确认框");
+        if (isFinishing() || isDestroyed() || !navigationStarted
+                || (exitDialog != null && exitDialog.isShowing())) return;
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(22), dp(22), dp(22), dp(20));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(Color.WHITE);
+        background.setCornerRadius(dp(20));
+        background.setStroke(dp(1), Color.rgb(217, 229, 240));
+        card.setBackground(background);
+
+        TextView icon = new TextView(this);
+        icon.setText("↩");
+        icon.setTextSize(27);
+        icon.setTextColor(Color.rgb(0, 104, 183));
+        icon.setGravity(Gravity.CENTER);
+        GradientDrawable iconBackground = new GradientDrawable();
+        iconBackground.setColor(Color.rgb(234, 244, 251));
+        iconBackground.setCornerRadius(dp(14));
+        icon.setBackground(iconBackground);
+        card.addView(icon, new LinearLayout.LayoutParams(dp(50), dp(50)));
+
+        TextView title = new TextView(this);
+        title.setText("退出导航？");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        title.setTextColor(Color.rgb(11, 61, 99));
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(-1, -2);
+        titleParams.topMargin = dp(16);
+        card.addView(title, titleParams);
+
+        TextView description = new TextView(this);
+        description.setText("退出后将停止当前路线指引和语音播报。");
+        description.setTextSize(14);
+        description.setTextColor(Color.rgb(102, 120, 138));
+        LinearLayout.LayoutParams descriptionParams = new LinearLayout.LayoutParams(-1, -2);
+        descriptionParams.topMargin = dp(6);
+        card.addView(description, descriptionParams);
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, dp(48));
+        actionsParams.topMargin = dp(24);
+        card.addView(actions, actionsParams);
+
+        TextView continueButton = exitAction("继续导航", false);
+        TextView exitButton = exitAction("退出导航", true);
+        actions.addView(continueButton, new LinearLayout.LayoutParams(0, -1, 1));
+        LinearLayout.LayoutParams exitParams = new LinearLayout.LayoutParams(0, -1, 1);
+        exitParams.leftMargin = dp(12);
+        actions.addView(exitButton, exitParams);
+
+        AlertDialog dialog = new AlertDialog.Builder(this).setView(card).create();
+        exitDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (exitDialog == dialog) exitDialog = null;
+        });
+        continueButton.setOnClickListener(v -> dialog.dismiss());
+        exitButton.setOnClickListener(v -> {
+            dialog.dismiss();
+            finish();
+        });
+        dialog.show();
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.dimAmount = 0.34f;
+            window.setAttributes(attributes);
+            window.setLayout(Math.min(getResources().getDisplayMetrics().widthPixels - dp(40), dp(400)),
+                    WindowManager.LayoutParams.WRAP_CONTENT);
+        }
+    }
+
+    private TextView exitAction(String label, boolean primary) {
+        TextView button = new TextView(this);
+        button.setText(label);
+        button.setTextSize(15);
+        button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        button.setTextColor(primary ? Color.WHITE : Color.rgb(0, 104, 183));
+        button.setGravity(Gravity.CENTER);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(primary ? Color.rgb(0, 104, 183) : Color.rgb(234, 244, 251));
+        background.setCornerRadius(dp(12));
+        button.setBackground(background);
+        return button;
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (navigationStarted && !isFinishing()) {
+            showExitConfirmation();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
     private String shortError(Throwable error) {
         String message = error.getMessage();
         if (message == null || message.trim().isEmpty()) {
@@ -1191,11 +1651,13 @@ public final class NaviGuideActivity extends Activity {
             } else if (walkHelper != null) {
                 walkHelper.resume();
             }
+            if (guidanceLocationClient == null) startGuidanceLocation();
         }
     }
 
     @Override
     protected void onPause() {
+        stopGuidanceLocation();
         mirroringNativeGuide = false;
         if (sdkNavigationView != null) sdkNavigationView.removeCallbacks(nativeGuideMirror);
         if (navigationStarted) {
@@ -1210,6 +1672,11 @@ public final class NaviGuideActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopGuidanceLocation();
+        if (exitDialog != null) {
+            exitDialog.dismiss();
+            exitDialog = null;
+        }
         mirroringNativeGuide = false;
         if (sdkNavigationView != null) {
             sdkNavigationView.removeCallbacks(nativeGuideMirror);

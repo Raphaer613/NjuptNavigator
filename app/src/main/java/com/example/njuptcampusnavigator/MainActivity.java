@@ -122,6 +122,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private EditText endInput;
     private LinearLayout searchResults;
     private TextView searchResultHeading;
+    private ImageView placeImage;
     private LinearLayout popularList;
     private TextView locationStatus;
     private TextView detailText;
@@ -475,11 +476,11 @@ public final class MainActivity extends Activity implements SensorEventListener 
         detailCard.setElevation(dp(2));
 
 // 左侧图片占位：104 × 104，保持 1:1
-        ImageView placeImage = new ImageView(this);
+        placeImage = new ImageView(this);
         placeImage.setContentDescription("地点图片");
         placeImage.setBackground(roundBackground(COLOR_PRIMARY_SOFT, 12));
         placeImage.setImageResource(R.drawable.ic_place_default);
-        placeImage.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        placeImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
 
         LinearLayout.LayoutParams imageParams =
                 new LinearLayout.LayoutParams(dp(104), dp(104));
@@ -1229,6 +1230,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         recordPlaceView(place);
         selectTab(2);
         selectedPlace = place;
+        placeImage.setImageResource(imageForPlace(place));
         updateSharePlaceText();
         routeEndPoint = place.coordinate;
         routeEndName = place.name;
@@ -1248,6 +1250,23 @@ public final class MainActivity extends Activity implements SensorEventListener 
         routeSummary.setText("终点已设为：" + place.name + "    请选择出行方式后规划");
         deleteActivityButton.setVisibility(place.temporary && "临时活动".equals(place.category)
                 ? View.VISIBLE : View.GONE);
+    }
+
+    private int imageForPlace(Place place) {
+        if (place == null) return R.drawable.ic_place_default;
+        switch (place.name) {
+            case "南一食堂": return R.drawable.place_canteen_1;
+            case "南二食堂": return R.drawable.place_canteen_2;
+            case "南三食堂": return R.drawable.place_canteen_3;
+            case "战邮广场": return R.drawable.place_zhanyou_square;
+            case "图书馆": return R.drawable.place_library;
+            default:
+                if (place.name.startsWith("教学楼一")) return R.drawable.place_teaching_1;
+                if (place.name.startsWith("教学楼二")) return R.drawable.place_teaching_2;
+                if (place.name.startsWith("教学楼三")) return R.drawable.place_teaching_3;
+                if (place.name.startsWith("教学楼四")) return R.drawable.place_teaching_4;
+                return R.drawable.ic_place_default;
+        }
     }
 
     private void confirmDeleteSelectedActivity() {
@@ -1273,6 +1292,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                     updateActivityEntryButton();
                     if (selectedPlace == activity) {
                         selectedPlace = null;
+                        placeImage.setImageResource(R.drawable.ic_place_default);
                         updateSharePlaceText();
                         detailText.setText("点击地图标记或搜索结果查看地点详情。");
                         deleteActivityButton.setVisibility(View.GONE);
